@@ -1,0 +1,43 @@
+{
+	"name": "finaqua-ide-template-migration-fdl",
+	"version": "1.0.0",
+	"description": "Generates FinAqua bronze (source -> staging) and silver (staging -> FDL) batch job JSONs from a Source-to-Silver mapping workbook",
+	"bin": {
+		"finaqua-ide-template-migration-fdl": "./dist/index.js"
+	},
+	"scripts": {
+		"dev": "tsx watch src/index.ts",
+		"typecheck": "tsc --noEmit",
+		"test": "tsx --test \"src/**/*.test.ts\"",
+		"generate": "tsx src/index.ts generate",
+		"inspect": "tsx src/index.ts inspect",
+		"verify:pg": "tsx src/scripts/verify-postgres.ts",
+		"check": "biome check .",
+		"check:apply": "biome check --write .",
+		"check:ci": "biome ci .",
+		"lint": "biome lint --write .",
+		"format": "biome format --write .",
+		"build": "tsup",
+		"prepare": "pnpm run build",
+		"prepublishOnly": "pnpm run build"
+	},
+	"files": [
+		"dist"
+	],
+	"keywords": [],
+	"author": "",
+	"license": "ISC",
+	"packageManager": "pnpm@10.33.0",
+	"dependencies": {
+		"commander": "^14.0.3",
+		"exceljs": "^4.4.0"
+	},
+	"type": "module",
+	"devDependencies": {
+		"@biomejs/biome": "2.4.15",
+		"@types/node": "^25.6.0",
+		"tsup": "^8.5.1",
+		"tsx": "^4.21.0",
+		"typescript": "^6.0.3"
+	}
+}

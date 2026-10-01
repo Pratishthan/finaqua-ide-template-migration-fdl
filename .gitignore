@@ -1,0 +1,6 @@
+node_modules
+dist
+*.idea
+out
+.DS_Store
+*.zip
