@@ -11,7 +11,7 @@ mapping.xlsx                     out/
                                    coverage.md                    what was generated + sheet defects
 ```
 
-The Limits workbook produces 34 staging tables, 33 FDL entities and 137 files. The jobs
+The Limits workbook ([tests/samples/limits_canonical_native_mapping.xlsx](tests/samples/limits_canonical_native_mapping.xlsx)) produces 34 staging tables, 33 FDL entities and 137 files. The jobs
 follow the templates in `reference/`, with the same readers and writers, the Kafka error
 writer and the load-then-audit execplan. Facts and dimensions are out of scope.
 
@@ -21,7 +21,7 @@ Read [OPEN-QUESTIONS.md](OPEN-QUESTIONS.md) before a first deployment.
 
 ```bash
 pnpm install
-pnpm run generate "reference/limits_canonical_native_mapping (1).xlsx" ./out
+pnpm run generate tests/samples/limits_canonical_native_mapping.xlsx ./out
 ```
 
 Then read `out/coverage.md`. It lists every sheet defect, each against its cell.
@@ -94,5 +94,5 @@ src/Mapping/
   emit.ts      writes the bundle and coverage.md
 src/scripts/verify-postgres.ts
 src/index.ts   CLI
-reference/     source templates and workbook
+tests/samples/ example Limits workbook (limits_canonical_native_mapping.xlsx)
 ```
