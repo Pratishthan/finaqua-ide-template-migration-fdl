@@ -11,9 +11,14 @@ mapping.xlsx                     out/
                                    coverage.md                    what was generated + sheet defects
 ```
 
-The Limits workbook ([tests/samples/limits_canonical_native_mapping.xlsx](tests/samples/limits_canonical_native_mapping.xlsx)) produces 34 staging tables, 33 FDL entities and 137 files. The jobs
-follow the templates in `reference/`, with the same readers and writers, the Kafka error
-writer and the load-then-audit execplan. Facts and dimensions are out of scope.
+The Finacle CDH Person workbook ([test/sample/FinacleCDH_Person_Mapping.xlsx](test/sample/FinacleCDH_Person_Mapping.xlsx))
+uses the default sheet layout (`DataMapping`/`Conditions`, no `--layout` override needed) and
+produces 28 staging tables, 25 FDL entities and 56 files. The Limits workbook
+([test/sample/limits_canonical_native_mapping.xlsx](test/sample/limits_canonical_native_mapping.xlsx)),
+whose tabs use `fdl_`-prefixed headers and needs `--layout layouts/fdl-prefixed.json`, produces 34
+staging tables, 33 FDL entities and 137 files. The jobs follow the templates in `reference/`, with the
+same readers and writers, the Kafka error writer and the load-then-audit execplan. Facts and
+dimensions are out of scope.
 
 Read [OPEN-QUESTIONS.md](OPEN-QUESTIONS.md) before a first deployment.
 
@@ -21,7 +26,7 @@ Read [OPEN-QUESTIONS.md](OPEN-QUESTIONS.md) before a first deployment.
 
 ```bash
 pnpm install
-pnpm run generate tests/samples/limits_canonical_native_mapping.xlsx ./out
+pnpm run generate test/sample/FinacleCDH_Person_Mapping.xlsx ./out
 ```
 
 Then read `out/coverage.md`. It lists every sheet defect, each against its cell.
@@ -94,5 +99,6 @@ src/Mapping/
   emit.ts      writes the bundle and coverage.md
 src/scripts/verify-postgres.ts
 src/index.ts   CLI
-tests/samples/ example Limits workbook (limits_canonical_native_mapping.xlsx)
+test/sample/ example workbooks: FinacleCDH_Person_Mapping.xlsx (default layout),
+             limits_canonical_native_mapping.xlsx (fdl_-prefixed layout)
 ```
