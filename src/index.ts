@@ -1,5 +1,5 @@
 import path from "node:path";
-import { Command } from "commander";
+import { Command, Option } from "commander";
 import ExcelJS from "exceljs";
 import { type DbType, dialect, parseDbType } from "@/Mapping/dialect.js";
 import { emitPlan } from "@/Mapping/emit.js";
@@ -9,6 +9,7 @@ import {
 	type LoadMode,
 	silverJob,
 } from "@/Mapping/finaqua.js";
+import { loadLayout } from "@/Mapping/layout.js";
 import { parseMappingWorkbook } from "@/Mapping/parse.js";
 import { buildPlan, DEFAULT_PLAN_OPTIONS } from "@/Mapping/plan.js";
 import type { Plan } from "@/Mapping/types.js";
@@ -20,12 +21,17 @@ type CommonOptions = {
 	batchName: string;
 	stagingPrefix: string;
 	watermark: string;
+	layout?: string;
 };
 
 async function readPlan(file: string, options: CommonOptions): Promise<Plan> {
 	const workbook = new ExcelJS.Workbook();
 	await workbook.xlsx.readFile(file);
-	const spec = parseMappingWorkbook(workbook, path.basename(file));
+	const spec = parseMappingWorkbook(
+		workbook,
+		path.basename(file),
+		loadLayout(options.layout),
+	);
 
 	return buildPlan(spec, {
 		...DEFAULT_PLAN_OPTIONS,
@@ -69,6 +75,14 @@ function withCommonOptions(command: Command): Command {
 			"--watermark <column>",
 			"FDL column that carries the source change time",
 			"data_persistance_time",
+		)
+		.addOption(
+			new Option(
+				"--layout <file>",
+				"JSON overriding the workbook's tab names and column headers",
+			)
+				.env("FDL_SHEET_LAYOUT")
+				.argParser(resolveExistingPath),
 		);
 }
 

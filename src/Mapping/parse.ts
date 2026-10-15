@@ -1,5 +1,6 @@
 import type ExcelJS from "exceljs";
 import { byHeader, normalizeHeader, readHeader } from "@/Mapping/cells.js";
+import { DEFAULT_LAYOUT, type SheetLayout } from "@/Mapping/layout.js";
 import type { Condition, MappingSpec, QueryStrategy } from "@/Mapping/types.js";
 
 /** The tabs are found by trimmed, case-insensitive name: the workbook as
@@ -13,6 +14,20 @@ function sheet(
 	);
 }
 
+function requireColumns(
+	header: Record<string, number>,
+	labels: string[],
+	where: { file: string; sheet: string },
+): void {
+	for (const label of labels) {
+		if (!(normalizeHeader(label) in header)) {
+			throw new Error(
+				`${where.file}: ${where.sheet} is missing the '${label}' column (set it in the sheet layout if it is named differently)`,
+			);
+		}
+	}
+}
+
 function cellRef(ws: ExcelJS.Worksheet, row: number): string {
 	return `${ws.name.trim()}!A${row}`;
 }
@@ -20,6 +35,7 @@ function cellRef(ws: ExcelJS.Worksheet, row: number): string {
 export function parseMappingWorkbook(
 	workbook: ExcelJS.Workbook,
 	sourceFile: string,
+	layout: SheetLayout = DEFAULT_LAYOUT,
 ): MappingSpec {
 	const spec: MappingSpec = {
 		sourceFile,
@@ -28,31 +44,26 @@ export function parseMappingWorkbook(
 		skipped: [],
 	};
 
-	const mapping = sheet(workbook, "DataMapping");
+	const { sheet: mappingName, columns: col } = layout.dataMapping;
+	const mapping = sheet(workbook, mappingName);
 	if (!mapping) {
-		throw new Error(`${sourceFile}: no DataMapping tab`);
+		throw new Error(`${sourceFile}: no ${mappingName} tab`);
 	}
 
 	const header = readHeader(mapping.getRow(1));
-	for (const required of [
-		"fdl_entity_name",
-		"fdl_column_name",
-		"source_entity_name",
-		"transformation_rule",
-	]) {
-		if (!(normalizeHeader(required) in header)) {
-			throw new Error(
-				`${sourceFile}: DataMapping is missing the '${required}' column`,
-			);
-		}
-	}
+	// Every column feeds the jobs: an unread one is blank on every row, which
+	// for source_column_name silently empties the staging projections.
+	requireColumns(header, Object.values(col), {
+		file: sourceFile,
+		sheet: mappingName,
+	});
 
 	mapping.eachRow((row, n) => {
 		if (n === 1) return;
 
 		const get = (name: string) => byHeader(row, header, name);
-		const entity = get("fdl_entity_name").toLowerCase();
-		const column = get("fdl_column_name").toLowerCase();
+		const entity = get(col.entity).toLowerCase();
+		const column = get(col.column).toLowerCase();
 		const cell = cellRef(mapping, n);
 
 		if (!entity && !column) return;
@@ -61,7 +72,7 @@ export function parseMappingWorkbook(
 			return;
 		}
 
-		const rule = get("transformation_rule");
+		const rule = get(col.rule);
 		if (!rule) {
 			spec.skipped.push({ cell, reason: `${entity}.${column} has no rule` });
 			return;
@@ -70,17 +81,24 @@ export function parseMappingWorkbook(
 		spec.rows.push({
 			entity,
 			column,
-			fdlType: get("fdl_data_type").toLowerCase(),
-			sourceEntity: get("source_entity_name").toLowerCase(),
-			sourceColumn: get("source_column_name"),
-			sourceType: get("source_data_type").toLowerCase(),
+			fdlType: get(col.fdlType).toLowerCase(),
+			sourceEntity: get(col.sourceEntity).toLowerCase(),
+			sourceColumn: get(col.sourceColumn),
+			sourceType: get(col.sourceType).toLowerCase(),
 			rule,
 			cell,
 		});
 	});
 
-	const conditions = sheet(workbook, "Conditions");
-	if (conditions) spec.conditions = parseConditions(conditions, spec);
+	// The Conditions tab is optional, but one the layout names explicitly must
+	// exist: a typo there would otherwise drop every join and union unnoticed.
+	const conditionsName = layout.conditions.sheet;
+	const conditions = sheet(workbook, conditionsName);
+	if (conditions) {
+		spec.conditions = parseConditions(conditions, spec, layout.conditions);
+	} else if (conditionsName !== DEFAULT_LAYOUT.conditions.sheet) {
+		throw new Error(`${sourceFile}: no ${conditionsName} tab`);
+	}
 
 	return spec;
 }
@@ -88,30 +106,24 @@ export function parseMappingWorkbook(
 function parseConditions(
 	ws: ExcelJS.Worksheet,
 	spec: MappingSpec,
+	{ sheet: name, columns: col }: SheetLayout["conditions"],
 ): Condition[] {
 	const header = readHeader(ws.getRow(1));
 	const found: Condition[] = [];
 
 	// A renamed or missing header would otherwise read as an empty clause for
 	// every entity, quietly dropping every join in the workbook.
-	for (const required of [
-		"fdl_entity_name",
-		"join_condition",
-		"query_strategy",
-	]) {
-		if (!(normalizeHeader(required) in header)) {
-			throw new Error(
-				`${spec.sourceFile}: Conditions is missing the '${required}' column`,
-			);
-		}
-	}
+	requireColumns(header, [col.entity, col.clause, col.strategy], {
+		file: spec.sourceFile,
+		sheet: name,
+	});
 
 	ws.eachRow((row, n) => {
 		if (n === 1) return;
 
-		const entity = byHeader(row, header, "fdl_entity_name").toLowerCase();
-		const clause = byHeader(row, header, "join_condition");
-		const rawStrategy = byHeader(row, header, "query_strategy").toUpperCase();
+		const entity = byHeader(row, header, col.entity).toLowerCase();
+		const clause = byHeader(row, header, col.clause);
+		const rawStrategy = byHeader(row, header, col.strategy).toUpperCase();
 		const cell = cellRef(ws, n);
 
 		if (!entity) return;
@@ -124,7 +136,7 @@ function parseConditions(
 		if (!strategy) {
 			spec.skipped.push({
 				cell,
-				reason: `${entity}: query_strategy '${rawStrategy}' is not JOIN or UNION`,
+				reason: `${entity}: ${col.strategy} '${rawStrategy}' is not JOIN or UNION`,
 			});
 			return;
 		}

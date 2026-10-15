@@ -1,0 +1,22 @@
+{
+	"dataMapping": {
+		"sheet": "DataMapping",
+		"columns": {
+			"entity": "entity_name",
+			"column": "column_name",
+			"fdlType": "data_type",
+			"sourceEntity": "source_entity_name",
+			"sourceColumn": "source_column_name",
+			"sourceType": "source_data_type",
+			"rule": "transformation_rule"
+		}
+	},
+	"conditions": {
+		"sheet": "Conditions",
+		"columns": {
+			"entity": "entity_name",
+			"clause": "join_condition",
+			"strategy": "query_strategy"
+		}
+	}
+}
