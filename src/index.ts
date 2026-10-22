@@ -21,6 +21,7 @@ type CommonOptions = {
 	batchName: string;
 	stagingPrefix: string;
 	watermark: string;
+	keyColumn: string;
 	layout?: string;
 };
 
@@ -37,6 +38,7 @@ async function readPlan(file: string, options: CommonOptions): Promise<Plan> {
 		...DEFAULT_PLAN_OPTIONS,
 		stagingPrefix: options.stagingPrefix,
 		watermarkColumn: options.watermark,
+		keyColumn: options.keyColumn,
 		target: dialect(options.targetDb),
 	});
 }
@@ -68,13 +70,18 @@ function withCommonOptions(command: Command): Command {
 		.option(
 			"-b, --batch-name <name>",
 			"batch name recorded in batch_run_detail and audit_log_detail",
-			"limits",
+			"CDH",
 		)
 		.option("--staging-prefix <prefix>", "staging table prefix", "s_")
 		.option(
 			"--watermark <column>",
 			"FDL column that carries the source change time",
-			"data_persistance_time",
+			DEFAULT_PLAN_OPTIONS.watermarkColumn,
+		)
+		.option(
+			"--key-column <column>",
+			"FDL column holding the business key, used as the upsert key",
+			DEFAULT_PLAN_OPTIONS.keyColumn,
 		)
 		.addOption(
 			new Option(

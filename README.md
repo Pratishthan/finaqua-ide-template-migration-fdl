@@ -13,10 +13,11 @@ mapping.xlsx                     out/
 
 The Finacle CDH Person workbook ([test/sample/FinacleCDH_Person_Mapping.xlsx](test/sample/FinacleCDH_Person_Mapping.xlsx))
 uses the default sheet layout (`DataMapping`/`Conditions`, no `--layout` override needed) and
-produces 28 staging tables, 25 FDL entities and 56 files. The Limits workbook
+produces 28 staging tables, 25 FDL entities and 109 files. The Limits workbook
 ([test/sample/limits_canonical_native_mapping.xlsx](test/sample/limits_canonical_native_mapping.xlsx)),
 whose tabs use `fdl_`-prefixed headers and needs `--layout layouts/fdl-prefixed.json`, produces 34
-staging tables, 33 FDL entities and 137 files. The jobs follow the templates in `reference/`, with the
+staging tables, 33 FDL entities and 137 files. Limits names its columns differently, so pass
+`-b limits --watermark data_persistance_time --key-column business_column_value` as well. The jobs follow the templates in `reference/`, with the
 same readers and writers, the Kafka error writer and the load-then-audit execplan. Facts and
 dimensions are out of scope.
 
@@ -44,9 +45,10 @@ Then read `out/coverage.md`. It lists every sheet defect, each against its cell.
 | Option | Default | Meaning |
 |---|---|---|
 | `--source-db`, `--target-db` | `postgres` | `postgres`, `oracle`, `mysql` or `mssql` (driver, URL, quoting, concatenation) |
-| `-b, --batch-name` | `limits` | Batch name for `batch_run_detail` / `audit_log_detail` |
+| `-b, --batch-name` | `CDH` | Batch name for `batch_run_detail` / `audit_log_detail` |
 | `--staging-prefix` | `s_` | Staging table prefix |
-| `--watermark` | `data_persistance_time` | FDL column carrying the source change time |
+| `--watermark` | `metadata_persisted_timestamp` | FDL column carrying the source change time |
+| `--key-column` | `metadata_business_key_value` | FDL column holding the business key, used as the upsert key |
 
 ## Running a bundle
 
@@ -59,15 +61,21 @@ Then read `out/coverage.md`. It lists every sheet defect, each against its cell.
 
 ## How it works
 
-- **Bronze** copies only the source columns the mapping needs, plus `batch_run_id` and
-  a business key. The projection and the incremental filter run on the source.
+- **Bronze** copies only the source columns the mapping needs, plus the standard
+  `metadata_*` / `audit_*` columns, taken from the FDL rows that read the table
+  (`_createdon` / `_modifiedon` are staged as `metadata_source_created_timestamp` /
+  `metadata_persisted_timestamp`). A sheet without them gets `batch_run_id` and a
+  concatenated `business_column_value` instead. The projection and the incremental filter run on the source.
+- **Pipeline columns** (`##PIPELINEGENERATED`) are filled by the job:
+  `metadata_batch_execution_id` = the running `batch_run_id`, `metadata_job_execution_id` = `0`,
+  `audit_*_by` = `'DataUser'`, `audit_*_timestamp` = `current_timestamp`, `audit_deleted_indicator` = `'N'`.
 - **Silver** builds one query per entity from `DataMapping` (projections) and
   `Conditions` (`JOIN` / `UNION`) against staging. Table references in the rules are
   rewritten token by token, so string literals are never changed.
 - **Casts** are added only when the kind of value changes. For example, `jsonb ->>` becomes `numeric`, and
   `bool` becomes `Y`/`N`. A narrowing `varchar` gets no cast, so Postgres raises an error instead of truncating.
 - **Incremental** jobs pick up rows where any contributing table changed since the
-  last audited watermark. They upsert on `business_column_value` with a `ts` guard
+  last audited watermark. They upsert on the key column with a `ts` guard
   (single-table jobs only).
 - **Audit:** each job writes one `audit_log_detail` row comparing source and target
   counts for that run, per layer.

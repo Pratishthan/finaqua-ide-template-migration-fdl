@@ -15,11 +15,14 @@ import {
 	type Issue,
 	type MappingRow,
 	type MappingSpec,
+	PIPELINE_GENERATED,
+	type PipelineColumn,
 	type Plan,
 	type SilverBranch,
 	type SilverColumn,
 	type SilverEntity,
 	STRAIGHT_MOVE,
+	type StandardColumn,
 } from "@/Mapping/types.js";
 
 export type PlanOptions = {
@@ -35,9 +38,27 @@ export type PlanOptions = {
 
 export const DEFAULT_PLAN_OPTIONS: Omit<PlanOptions, "target"> = {
 	stagingPrefix: "s_",
-	watermarkColumn: "data_persistance_time",
-	keyColumn: "business_column_value",
+	watermarkColumn: "metadata_persisted_timestamp",
+	keyColumn: "metadata_business_key_value",
 };
+
+/** FDL column the running batch is written to; a table without it gets a
+ * batch_run_id column instead. */
+export const BATCH_COLUMN = "metadata_batch_execution_id";
+
+/** What the job writes into each ##PIPELINEGENERATED column. */
+export const PIPELINE_VALUES: Record<string, string> = {
+	[BATCH_COLUMN]: "brd.batch_run_id",
+	metadata_job_execution_id: "0",
+	audit_created_by: "'DataUser'",
+	audit_created_timestamp: "current_timestamp",
+	audit_updated_by: "'DataUser'",
+	audit_updated_timestamp: "current_timestamp",
+	audit_deleted_indicator: "'N'",
+};
+
+/** FDL columns every table carries; staging borrows them from the FDL rows. */
+const STANDARD = /^(metadata|audit)_/;
 
 /** Values of source_entity_name / source_data_type meaning "no source". */
 const NONE = new Set(["", "na", "##na", "n/a"]);
@@ -51,6 +72,13 @@ function sourceTablesOf(row: MappingRow): string[] {
 
 const isStraight = (row: MappingRow) =>
 	row.rule.trim().toUpperCase() === STRAIGHT_MOVE;
+
+const isPipelineGenerated = (row: MappingRow) =>
+	row.rule.trim().toUpperCase() === PIPELINE_GENERATED;
+
+/** Name a source column has in its staging table. */
+export const stagedName = (table: BronzeTable, column: string) =>
+	table.stagedAs[column] ?? column;
 
 /** Type family, so a cast is only emitted when the kind of value changes. */
 type Family =
@@ -206,6 +234,7 @@ class Planner {
 		const tables = this.knownTables();
 
 		for (const row of this.spec.rows) {
+			if (isPipelineGenerated(row)) continue;
 			const typed = !NONE.has(row.sourceType.toLowerCase());
 			const owners = sourceTablesOf(row);
 
@@ -240,9 +269,13 @@ class Planner {
 				this.addPhysical(r.table, r.column, row.sourceType);
 			if (refs.length > 0) continue;
 
+			// A constant (`'customer_identifier.bank_identification'`) reads nothing,
+			// and `##NA` is the sheet's "no source column", never a column name.
+			if (isStringLiteral(row.rule)) continue;
 			const [table] = owners;
 			const column = row.sourceColumn.split(/[.,]/)[0]?.trim().toLowerCase();
-			if (table && column) this.addPhysical(table, column, row.sourceType);
+			if (table && column && !NONE.has(column))
+				this.addPhysical(table, column, row.sourceType);
 		}
 
 		// Join columns have to reach staging too, even if nothing maps them. The
@@ -348,6 +381,7 @@ class Planner {
 
 	bronze(): BronzeTable[] {
 		const keys = this.stagingKeys();
+		const tables = new Set(this.physical.keys());
 		const result: BronzeTable[] = [];
 
 		const mapped = new Map<string, { column: string; type: string }>();
@@ -384,10 +418,19 @@ class Planner {
 				);
 			}
 
-			const columns: Column[] = [...cols].map(([name, type]) => ({
-				name,
-				type: type || "text",
-			}));
+			const { standard, stagedAs } = this.standardColumns(source, tables);
+			// A source column staged under its standard name is dropped, unless a
+			// rule or join still reads it under its own.
+			const columns: Column[] = [...cols]
+				.filter(
+					([name]) =>
+						!Object.hasOwn(stagedAs, name) ||
+						this.readAsIs(source, name, tables),
+				)
+				.map(([name, type]) => ({
+					name,
+					type: type || "text",
+				}));
 
 			if (!watermark) {
 				this.issue(
@@ -396,8 +439,13 @@ class Planner {
 					`no source column maps to ${this.options.watermarkColumn} - incremental staging job not generated`,
 				);
 			}
-			const key = keys.get(source) ?? [];
-			if (key.length === 0) {
+			const keyColumn = standard.some(
+				(c) => c.name === this.options.keyColumn && "rule" in c,
+			)
+				? this.options.keyColumn
+				: undefined;
+			const key = keyColumn ? [] : (keys.get(source) ?? []);
+			if (!keyColumn && key.length === 0) {
 				this.issue(
 					"info",
 					scope,
@@ -409,7 +457,10 @@ class Planner {
 				source,
 				staging: `${this.options.stagingPrefix}${source}`,
 				columns,
+				standard,
+				stagedAs,
 				key,
+				keyColumn,
 				watermark,
 			});
 		}
@@ -417,9 +468,140 @@ class Planner {
 		return result.sort((a, b) => a.source.localeCompare(b.source));
 	}
 
+	/**
+	 * The standard columns (metadata_*, audit_*) of a staging table. The sheet
+	 * maps them only for FDL entities, so they are borrowed from the first entity
+	 * whose standard rows read this table - the rows its query for this table
+	 * uses. Another entity mapping them differently is reported; the first wins.
+	 */
+	standardColumns(
+		source: string,
+		tables: Set<string>,
+	): { standard: StandardColumn[]; stagedAs: Record<string, string> } {
+		const scope = `${this.options.stagingPrefix}${source}`;
+		const candidates = [...this.entities].flatMap(([entity, rows]) => {
+			const picked = new Map<string, MappingRow>();
+			for (const r of rows) {
+				if (!STANDARD.test(r.column) || picked.has(r.column)) continue;
+				if (this.inBranch(r, source, tables)) picked.set(r.column, r);
+			}
+			const reads = [...picked.values()].some((r) =>
+				sourceTablesOf(r).includes(source),
+			);
+			return reads ? [{ entity, picked }] : [];
+		});
+
+		const [first, ...others] = candidates;
+		if (!first) return { standard: [], stagedAs: {} };
+
+		for (const other of others) {
+			for (const [column, r] of first.picked) {
+				const o = other.picked.get(column);
+				if (
+					o?.rule.trim() === r.rule.trim() &&
+					o.sourceColumn === r.sourceColumn
+				)
+					continue;
+				this.issue(
+					"warning",
+					scope,
+					`${column} is staged as ${first.entity} maps it (${r.cell}); ${other.entity} maps it differently`,
+					o?.cell,
+				);
+			}
+		}
+
+		const standard: StandardColumn[] = [];
+		const stagedAs: Record<string, string> = {};
+		for (const r of first.picked.values()) {
+			const type = r.fdlType || "text";
+			if (isPipelineGenerated(r)) {
+				standard.push(this.pipelineColumn(r, scope));
+			} else if (isStraight(r)) {
+				const column = r.sourceColumn.toLowerCase();
+				standard.push({ name: r.column, type, copies: column });
+				stagedAs[column] = r.column;
+			} else {
+				const foreign = columnRefs(r.rule, tables).filter(
+					(ref) => ref.table !== source,
+				);
+				if (foreign.length > 0) {
+					this.issue(
+						"warning",
+						scope,
+						`${r.column}: the rule reads ${foreign.map((f) => `${f.table}.${f.column}`).join(", ")}, which ${scope} does not hold - staged as NULL`,
+						r.cell,
+					);
+				}
+				standard.push({
+					name: r.column,
+					type,
+					rule:
+						foreign.length > 0
+							? `cast(null as ${pgType(type)})`
+							: ruleExpr(r.rule.trim(), type),
+				});
+			}
+		}
+
+		return { standard, stagedAs };
+	}
+
+	/** Whether a rule or a join clause reads `source.column` by name. Straight
+	 * moves are not counted: they read whatever name staging holds it under. */
+	readAsIs(source: string, column: string, tables: Set<string>): boolean {
+		const reads = (
+			sql: string,
+			named: Set<string>,
+			resolve: (t: string) => string = (t) => t,
+		) =>
+			columnRefs(sql, named).some(
+				(r) => resolve(r.table) === source && r.column === column,
+			);
+
+		if (
+			this.spec.rows.some(
+				(row) =>
+					!isStraight(row) &&
+					!isPipelineGenerated(row) &&
+					reads(row.rule, tables),
+			)
+		)
+			return true;
+
+		return this.spec.conditions.some((c) => {
+			const aliases = fromAliases(c.clause);
+			return reads(
+				c.clause,
+				new Set([...aliases.keys(), ...tables]),
+				(t) => aliases.get(t) ?? t,
+			);
+		});
+	}
+
+	/** The value the job writes into a ##PIPELINEGENERATED column. */
+	pipelineColumn(row: MappingRow, scope: string): PipelineColumn {
+		const type = row.fdlType || "text";
+		const value = PIPELINE_VALUES[row.column];
+		if (value === undefined) {
+			this.issue(
+				"warning",
+				scope,
+				`${row.column} is ##PIPELINEGENERATED but has no pipeline value - loaded as NULL`,
+				row.cell,
+			);
+		}
+		return {
+			name: row.column,
+			type,
+			value: value ?? `cast(null as ${pgType(type)})`,
+		};
+	}
+
 	/** Checks a rule for defects that would make the silver query fail or load
 	 * the wrong thing. Reported against the row's cell. */
 	checkRule(row: MappingRow, tables: Set<string>) {
+		if (isPipelineGenerated(row)) return;
 		if (isStraight(row)) {
 			this.checkStraightTypes(row);
 			return;
@@ -542,19 +724,28 @@ class Planner {
 				];
 			}
 
-			// UNION branches must line up column for column: fill each branch's gaps
-			// with a typed NULL, in sheet order.
 			const columns = this.entityColumns(name, rows);
+			const pipeline = columns.flatMap((c) => {
+				const r = rows.find((row) => row.column === c.name);
+				return r && isPipelineGenerated(r)
+					? [this.pipelineColumn(r, name)]
+					: [];
+			});
+
+			// UNION branches must line up column for column: fill each branch's gaps
+			// with a typed NULL, in sheet order. Pipeline columns are added by the job.
 			for (const b of branches) {
-				b.columns = columns.map(
-					(c) =>
-						b.columns.find((bc) => bc.name === c.name) ?? {
-							name: c.name,
-							fdlType: c.type,
-							expr: `cast(null as ${pgType(c.type)})`,
-							cell: "",
-						},
-				);
+				b.columns = columns
+					.filter((c) => !pipeline.some((p) => p.name === c.name))
+					.map(
+						(c) =>
+							b.columns.find((bc) => bc.name === c.name) ?? {
+								name: c.name,
+								fdlType: c.type,
+								expr: `cast(null as ${pgType(c.type)})`,
+								cell: "",
+							},
+					);
 			}
 
 			const keyRow = rows.find((r) => r.column === this.options.keyColumn);
@@ -603,7 +794,16 @@ class Planner {
 				);
 			}
 
-			result.push({ name, strategy, branches, columns, keyed, watermark });
+			result.push({
+				name,
+				strategy,
+				branches,
+				columns,
+				pipeline,
+				keyColumn: this.options.keyColumn,
+				keyed,
+				watermark,
+			});
 		}
 
 		return result;
@@ -679,10 +879,15 @@ class Planner {
 				continue;
 			}
 
+			// The job adds it around the query (SilverEntity.pipeline).
+			if (isPipelineGenerated(row)) continue;
+
 			let expr: string;
 			if (isStraight(row)) {
 				const table = sourceTablesOf(row)[0] ?? "";
 				const alias = from.aliases.get(table);
+				const staging = stagingOf(table);
+				const column = row.sourceColumn.toLowerCase();
 				if (!alias) {
 					this.issue(
 						"error",
@@ -692,7 +897,7 @@ class Planner {
 					);
 				}
 				expr = straightExpr(
-					`${quote(alias ?? table)}.${quote(row.sourceColumn.toLowerCase())}`,
+					`${quote(alias ?? table)}.${quote(staging ? stagedName(staging, column) : column)}`,
 					row.sourceType,
 					row.fdlType,
 				);
@@ -712,8 +917,15 @@ class Planner {
 		}
 
 		const watermarks = [...from.aliases].flatMap(([table, alias]) => {
-			const column = stagingOf(table)?.watermark;
-			return column ? [{ alias: quote(alias), column }] : [];
+			const staging = stagingOf(table);
+			return staging?.watermark
+				? [
+						{
+							alias: quote(alias),
+							column: stagedName(staging, staging.watermark),
+						},
+					]
+				: [];
 		});
 
 		const reads = [...from.aliases.keys()].flatMap((t) => {

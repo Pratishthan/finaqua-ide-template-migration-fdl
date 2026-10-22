@@ -193,7 +193,7 @@ function renderCoverage(plan: Plan, opts: JobOptions): string {
 	lines.push("|---|---|---|---|---|");
 	for (const b of plan.bronze) {
 		lines.push(
-			`| ${b.staging} | ${b.source} | ${b.columns.length} | ${b.key.join(", ") || "-"} | ${b.watermark ?? "-"} |`,
+			`| ${b.staging} | ${b.source} | ${b.columns.length + b.standard.length} | ${b.keyColumn ?? (b.key.join(", ") || "-")} | ${b.watermark ?? "-"} |`,
 		);
 	}
 
@@ -205,7 +205,7 @@ function renderCoverage(plan: Plan, opts: JobOptions): string {
 	for (const s of plan.silver) {
 		const reads = [...new Set(s.branches.flatMap((b) => b.reads))];
 		lines.push(
-			`| ${s.name} | ${s.strategy} | ${reads.join(", ")} | ${s.columns.length} | ${s.keyed ? "business_column_value" : "-"} | ${s.watermark ? "yes" : "no"} |`,
+			`| ${s.name} | ${s.strategy} | ${reads.join(", ")} | ${s.columns.length} | ${s.keyed ? s.keyColumn : "-"} | ${s.watermark ? "yes" : "no"} |`,
 		);
 	}
 

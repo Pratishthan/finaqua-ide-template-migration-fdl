@@ -6,7 +6,12 @@ import { buildPlan, DEFAULT_PLAN_OPTIONS } from "@/Mapping/plan.js";
 import type { Condition, MappingRow, MappingSpec } from "@/Mapping/types.js";
 
 const pg = dialect("postgres");
-const options = { ...DEFAULT_PLAN_OPTIONS, target: pg };
+const options = {
+	...DEFAULT_PLAN_OPTIONS,
+	watermarkColumn: "data_persistance_time",
+	keyColumn: "business_column_value",
+	target: pg,
+};
 const jobOptions = { batchName: "limits", source: pg, target: pg };
 
 let line = 1;

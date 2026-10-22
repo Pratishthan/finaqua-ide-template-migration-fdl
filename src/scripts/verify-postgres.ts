@@ -87,8 +87,11 @@ const ddlColumns = new Map(
 	),
 );
 
-const added = /^(batch_run_id|business_column_(name|value))\b/;
-const sourceTables = new Map<string, string>(); // source table -> staging table
+const added =
+	/^"?(batch_run_id|business_column_(name|value)|metadata_\w+|audit_\w+)\b/;
+const copied =
+	/(?:select |, )"?([A-Za-z_]\w*)"? as "?((?:metadata|audit)_\w+)"?(?=,| from )/g;
+const sourceTables = new Map<string, { staging: string; query: string }>();
 for (const job of bronzeJobs) {
 	const view = job.source.views.find(
 		(v) => v.reader === "source_db_connection",
@@ -96,12 +99,20 @@ for (const job of bronzeJobs) {
 	const staging =
 		job.srcevents[0]?.procedure.execplan[0]?.actions[0]?.params.table;
 	const source = view?.params.table;
-	if (source && staging) sourceTables.set(source, staging);
+	if (source && staging && view)
+		sourceTables.set(source, { staging, query: view.params.query });
 }
 
 const sourceDdl = [...sourceTables]
-	.map(([source, staging]) => {
-		const cols = (ddlColumns.get(staging) ?? []).filter((c) => !added.test(c));
+	.map(([source, { staging, query }]) => {
+		const staged = ddlColumns.get(staging) ?? [];
+		const cols = staged.filter((c) => !added.test(c));
+		for (const [, column, as] of query.matchAll(copied)) {
+			const type = staged
+				.find((c) => c.replaceAll('"', "").startsWith(`${as} `))
+				?.replace(/^\S+ /, "");
+			if (type) cols.push(`${q(column ?? "")} ${type}`);
+		}
 		return `create table src.${q(source)} (${cols.join(", ")});`;
 	})
 	.join("\n");

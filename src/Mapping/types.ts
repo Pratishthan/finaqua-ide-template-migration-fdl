@@ -17,6 +17,10 @@
 
 export const STRAIGHT_MOVE = "##STRAIGHTMOVE";
 
+/** Rule of an FDL column the pipeline fills itself (audit_*, metadata_*_id):
+ * it has no source, but the FDL table still carries it. */
+export const PIPELINE_GENERATED = "##PIPELINEGENERATED";
+
 export type MappingRow = {
 	/** FDL (silver) entity, e.g. "limit_master". */
 	entity: string;
@@ -68,6 +72,18 @@ export type Issue = {
 
 export type Column = { name: string; type: string };
 
+/** A ##PIPELINEGENERATED column: the job adds `value` around the query, where
+ * the running batch is joined as `brd`. */
+export type PipelineColumn = Column & { value: string };
+
+/** A staging column taken from the FDL sheet's standard rows (metadata_*,
+ * audit_*): a source column staged under the FDL name, a sheet rule over the
+ * source row, or a pipeline value. */
+export type StandardColumn =
+	| (Column & { copies: string })
+	| (Column & { rule: string })
+	| PipelineColumn;
+
 /** One source table copied into staging: the bronze job. */
 export type BronzeTable = {
 	/** Source table name, e.g. "limit". */
@@ -76,8 +92,16 @@ export type BronzeTable = {
 	staging: string;
 	/** Physical source columns the FDL mapping needs, in first-seen order. */
 	columns: Column[];
+	/** Standard columns, in sheet order, after `columns`. */
+	standard: StandardColumn[];
+	/** Source column -> the name staging holds it under, for a source column
+	 * copied into a standard column (`_modifiedon` -> metadata_persisted_timestamp). */
+	stagedAs: Record<string, string>;
 	/** Natural key of the source row, if one can be derived from the mapping. */
 	key: string[];
+	/** Standard column the staging rows are upserted on, when the sheet gives
+	 * one; otherwise `key` is concatenated into business_column_value. */
+	keyColumn?: string | undefined;
 	/** Source column that drives incremental loads, e.g. "_modifiedon". */
 	watermark?: string | undefined;
 };
@@ -110,7 +134,11 @@ export type SilverEntity = {
 	branches: SilverBranch[];
 	/** FDL columns in sheet order - the writer's field list. */
 	columns: Column[];
-	/** Whether `business_column_value` can be used as an upsert key. */
+	/** Columns of `columns` the job fills itself; the branches leave them out. */
+	pipeline: PipelineColumn[];
+	/** FDL column holding the business key, e.g. "metadata_business_key_value". */
+	keyColumn: string;
+	/** Whether `keyColumn` can be used as an upsert key. */
 	keyed: boolean;
 	/** FDL column carrying the source change time, e.g. "data_persistance_time". */
 	watermark?: string | undefined;

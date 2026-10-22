@@ -1,5 +1,5 @@
 import type { Dialect } from "@/Mapping/dialect.js";
-import { pgType } from "@/Mapping/plan.js";
+import { BATCH_COLUMN, pgType } from "@/Mapping/plan.js";
 import type { Plan } from "@/Mapping/types.js";
 
 /**
@@ -43,32 +43,39 @@ export function buildDdl(plan: Plan, target: Dialect): string {
 		"-- Bronze: staging copies of the source tables.",
 	];
 
-	const table = (name: string, columns: string[], keyed: boolean) => {
+	const table = (name: string, columns: string[], key: string | undefined) => {
 		out.push(`create table if not exists ${q(name)} (`);
 		out.push(columns.map((c) => `\t${c}`).join(",\n"));
 		out.push(");");
-		// Upsert matches on business_column_value, which needs a unique index.
+		// Upsert matches on the key column, which needs a unique index.
 		// Postgres treats NULLs as distinct, so a NULL key never conflicts.
-		if (keyed) {
+		if (key) {
 			out.push(
-				`create unique index if not exists ${name}_bcv_uk on ${q(name)} (business_column_value);`,
+				`create unique index if not exists ${name}_bcv_uk on ${q(name)} (${q(key)});`,
 			);
 		}
 		out.push("");
 	};
 
+	const batchRunId = (columns: { name: string }[]) =>
+		columns.some((c) => c.name === BATCH_COLUMN)
+			? []
+			: ["batch_run_id integer"];
+
 	for (const b of plan.bronze) {
-		const keyed = b.key.length > 0;
+		const concatKey = !b.keyColumn && b.key.length > 0;
 		table(
 			b.staging,
 			[
-				"batch_run_id integer",
-				...b.columns.map((c) => `${q(c.name)} ${pgType(c.type)}`),
-				...(keyed
+				...batchRunId(b.standard),
+				...[...b.columns, ...b.standard].map(
+					(c) => `${q(c.name)} ${pgType(c.type)}`,
+				),
+				...(concatKey
 					? ["business_column_name text", "business_column_value text"]
 					: []),
 			],
-			keyed,
+			b.keyColumn ?? (concatKey ? "business_column_value" : undefined),
 		);
 	}
 
@@ -77,10 +84,10 @@ export function buildDdl(plan: Plan, target: Dialect): string {
 		table(
 			s.name,
 			[
-				"batch_run_id integer",
+				...batchRunId(s.pipeline),
 				...s.columns.map((c) => `${q(c.name)} ${pgType(c.type)}`),
 			],
-			s.keyed,
+			s.keyed ? s.keyColumn : undefined,
 		);
 	}
 

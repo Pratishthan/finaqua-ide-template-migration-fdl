@@ -1,7 +1,12 @@
 import type { Dialect } from "@/Mapping/dialect.js";
-import { family } from "@/Mapping/plan.js";
-import { hasWhere, literal } from "@/Mapping/sql.js";
-import type { BronzeTable, Column, SilverEntity } from "@/Mapping/types.js";
+import { BATCH_COLUMN, family, stagedName } from "@/Mapping/plan.js";
+import { hasWhere, literal, rewriteQualifiers } from "@/Mapping/sql.js";
+import type {
+	BronzeTable,
+	Column,
+	PipelineColumn,
+	SilverEntity,
+} from "@/Mapping/types.js";
 
 /**
  * Builds FinAqua batch job configs in the exact shape of the hand-written
@@ -80,6 +85,13 @@ const KEY_FIELDS: Field[] = [
 	{ name: "business_column_name", type: "string" },
 	{ name: "business_column_value", type: "string" },
 ];
+
+/** Column a table records the batch run in: the sheet's own, if it has one. */
+function batchColumn(pipeline: PipelineColumn[]): string {
+	return pipeline.some((p) => p.name === BATCH_COLUMN)
+		? BATCH_COLUMN
+		: BATCH_RUN_ID.name;
+}
 
 function runningBatch(batchName: string): string {
 	return `select batch_run_id from batch_run_detail where batch_name = ${literal(batchName)} and status = 'running'`;
@@ -182,6 +194,7 @@ function auditPlan(opts: {
 	table: string;
 	sourceCount: string;
 	watermark: string | undefined;
+	batchColumn: string;
 }) {
 	const wm = opts.watermark ?? "cast(null as timestamp)";
 
@@ -203,7 +216,7 @@ function auditPlan(opts: {
 							name: "target",
 							reader: "target_db_connection",
 							params: {
-								query: `select count(*) as target_row_count, max(${wm}) as max_data_persistance_time, min(${wm}) as min_data_persistance_time from ${opts.table} where batch_run_id = (${runningBatch(opts.batchName)})`,
+								query: `select count(*) as target_row_count, max(${wm}) as max_data_persistance_time, min(${wm}) as min_data_persistance_time from ${opts.table} where ${opts.batchColumn} = (${runningBatch(opts.batchName)})`,
 							},
 						},
 						{
@@ -325,15 +338,37 @@ export function bronzeJob(
 ) {
 	const q = opts.source.quote;
 	const incremental = mode === "incremental";
-	const keyed = table.key.length > 0;
+	// The sheet's key column, or else the source key concatenated into
+	// business_column_value.
+	const concatKey = !table.keyColumn && table.key.length > 0;
+	const keyColumn =
+		table.keyColumn ?? (concatKey ? "business_column_value" : undefined);
+	const keyed = keyColumn !== undefined;
+	const pipeline = table.standard.filter(
+		(c): c is PipelineColumn => "value" in c,
+	);
+	const batch = batchColumn(pipeline);
+	const watermark = table.watermark && stagedName(table, table.watermark);
 
 	const filter =
 		incremental && table.watermark
 			? ` where ${q(table.watermark)} > ${lowerBound(table.source)}`
 			: "";
 
-	const projection = table.columns.map((c) => q(c.name));
-	if (keyed) {
+	const projection = [
+		...table.columns.map((c) => q(c.name)),
+		// Pipeline values are added by the engine query, where brd is joined.
+		...table.standard.flatMap((c) =>
+			"copies" in c
+				? [`${q(c.copies)} as ${q(c.name)}`]
+				: "rule" in c
+					? [
+							`${rewriteQualifiers(c.rule, (t) => (t === table.source ? q(t) : undefined))} as ${q(c.name)}`,
+						]
+					: [],
+		),
+	];
+	if (concatKey) {
 		projection.push(
 			`${literal(table.key.join(" ~ "))} as business_column_name`,
 			`${opts.source.concat(table.key.flatMap((k, i) => (i === 0 ? [q(k)] : ["'~'", q(k)])))} as business_column_value`,
@@ -342,8 +377,12 @@ export function bronzeJob(
 
 	const view = viewName(table.source, opts.source);
 	const outColumns = [
-		...table.columns.map((c) => c.name),
-		...(keyed ? KEY_FIELDS.map((f) => f.name) : []),
+		...(batch === BATCH_RUN_ID.name ? ["brd.batch_run_id"] : []),
+		...table.columns.map((c) => `${view}.${c.name}`),
+		...table.standard.map((c) =>
+			"value" in c ? `${c.value} as ${c.name}` : `${view}.${c.name}`,
+		),
+		...(concatKey ? KEY_FIELDS.map((f) => `${view}.${f.name}`) : []),
 	];
 
 	return job({
@@ -369,23 +408,25 @@ export function bronzeJob(
 				},
 			},
 		],
-		query: `select brd.batch_run_id, ${outColumns.map((c) => `${view}.${c}`).join(", ")} from ${view} JOIN (SELECT batch_run_id FROM batch_run_detail WHERE batch_name = ${literal(opts.batchName)} AND status = 'running') brd on TRUE`,
+		query: `select ${outColumns.join(", ")} from ${view} JOIN (SELECT batch_run_id FROM batch_run_detail WHERE batch_name = ${literal(opts.batchName)} AND status = 'running') brd on TRUE`,
 		action: incremental && keyed ? "upsert" : "insert",
 		fields: [
-			BATCH_RUN_ID,
+			...(batch === BATCH_RUN_ID.name ? [BATCH_RUN_ID] : []),
 			...table.columns.map((c) => field(c, "string")),
-			...(keyed ? KEY_FIELDS : []),
+			...table.standard.map((c) => field(c, "string")),
+			...(concatKey ? KEY_FIELDS : []),
 		],
-		key: keyed ? ["business_column_value"] : [],
+		key: keyColumn ? [keyColumn] : [],
 		// Upserting on the source key must never let an older extract overwrite a
 		// newer staged row; the writer adds `where staged.<ts> < excluded.<ts>`.
-		ts: incremental && keyed && table.watermark ? [table.watermark] : [],
+		ts: incremental && keyed && watermark ? [watermark] : [],
 		audit: auditPlan({
 			batchName: opts.batchName,
 			layer: "bronze",
 			table: table.staging,
 			sourceCount: `select count(*) as source_row_count from ${q(table.source)}${filter}`,
-			watermark: table.watermark && opts.target.quote(table.watermark),
+			watermark: watermark && opts.target.quote(watermark),
+			batchColumn: batch,
 		}),
 	});
 }
@@ -439,6 +480,11 @@ export function silverJob(
 	const incremental = mode === "incremental";
 	const body = silverBody(entity, mode, opts.target);
 	const namespace = `fdl-${opts.batchName}`;
+	const batch = batchColumn(entity.pipeline);
+	const added = [
+		...(batch === BATCH_RUN_ID.name ? ["brd.batch_run_id"] : []),
+		...entity.pipeline.map((p) => `${p.value} as ${opts.target.quote(p.name)}`),
+	];
 
 	const built = job({
 		name: entity.name,
@@ -450,15 +496,18 @@ export function silverJob(
 				name: entity.name,
 				reader: "source_db_connection",
 				params: {
-					query: `select brd.batch_run_id, q.* from (${body}) as q JOIN (${runningBatch(opts.batchName)}) brd on TRUE`,
+					query: `select ${[...added, "q.*"].join(", ")} from (${body}) as q JOIN (${runningBatch(opts.batchName)}) brd on TRUE`,
 					table: entity.name,
 				},
 			},
 		],
 		query: `select * from ${entity.name};`,
 		action: incremental && entity.keyed ? "upsert" : "insert",
-		fields: [BATCH_RUN_ID, ...entity.columns.map((c) => field(c, "text"))],
-		key: entity.keyed ? ["business_column_value"] : [],
+		fields: [
+			...(batch === BATCH_RUN_ID.name ? [BATCH_RUN_ID] : []),
+			...entity.columns.map((c) => field(c, "text")),
+		],
+		key: entity.keyed ? [entity.keyColumn] : [],
 		// The ts guard compares the FDL watermark, which only tracks the table the
 		// row's data_persistance_time is mapped from. On a join that is the driving
 		// table, so a change in a joined table would be selected by the query and
@@ -477,6 +526,7 @@ export function silverJob(
 			table: entity.name,
 			sourceCount: `select count(*) as source_row_count from (${body}) as q`,
 			watermark: entity.watermark && opts.target.quote(entity.watermark),
+			batchColumn: batch,
 		}),
 	});
 
