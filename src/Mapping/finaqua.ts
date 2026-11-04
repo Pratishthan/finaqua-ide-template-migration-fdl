@@ -97,7 +97,15 @@ function runningBatch(batchName: string): string {
 	return `select batch_run_id from batch_run_detail where batch_name = ${literal(batchName)} and status = 'running'`;
 }
 
-function providers() {
+/** The provider of the validator step; the name is the one the flow builder
+ * gives its own JSON schema validator. */
+const JSON_VALIDATOR = {
+	name: "_dfltjsonvalidator",
+	provider: "com.fininfra.aqua.validators.JsonSchemaValidator",
+	params: {},
+};
+
+function providers(validated: boolean) {
 	const connection = (name: string, prefix: string) => ({
 		name,
 		type: "QUERY",
@@ -149,7 +157,7 @@ function providers() {
 				broadcast: "com.fininfra.aqua.extn.kafka.KafkaProducerFunction",
 			},
 		],
-		validators: [],
+		validators: validated ? [JSON_VALIDATOR] : [],
 	};
 }
 
@@ -166,6 +174,38 @@ const ON_ERROR = [
 		},
 	},
 ];
+
+/** Where rejected rows go. `AquaExecutorConfig.validate` refuses a job that has a
+ * validator step and no onvalidationerror. Same Kafka writer as ON_ERROR, its own
+ * topic: a rejected row is bad data to chase, not a job failure. */
+const ON_VALIDATION_ERROR = [
+	{
+		...ON_ERROR[0],
+		name: "validationErrorWriter",
+		params: { ...ON_ERROR[0]?.params, topic: "validationErrorTopic" },
+	},
+];
+
+/**
+ * The data quality step. ALLERRORS so one rejected row reports everything wrong
+ * with it; the empty ignore lists make every failure an ERROR, which keeps the
+ * row out of the write. The lists are `[""]` as the flow builder writes them.
+ */
+function validatorStep(name: string, schema: string, keys: string[]) {
+	const stepName = `${name}_dq`;
+
+	return {
+		name: stepName,
+		type: "VALIDATOR",
+		validation: {
+			name: stepName,
+			returntype: "ALLERRORS",
+			validationMessageKeys: keys,
+			ignore: { errorcodes: [""], errortypes: [""], errordesc: [""] },
+			validations: [{ name: JSON_VALIDATOR.name, params: { schema } }],
+		},
+	};
+}
 
 const AUDIT_FIELDS: Field[] = [
 	{ name: "batch_run_id", type: "int" },
@@ -263,13 +303,36 @@ function job(opts: {
 	 * newer. Ignored by an insert. */
 	ts: string[];
 	audit: ReturnType<typeof auditPlan>;
+	validation?: ReturnType<typeof validatorStep> | undefined;
 }) {
+	const validated = opts.validation !== undefined;
+	const load = {
+		steps: opts.validation ? [opts.validation] : [],
+		actions: [
+			{
+				name: `${opts.event}_writer`,
+				condition: [],
+				destination: "destination_storage",
+				params: {
+					table: opts.table,
+					action: opts.action,
+					fields: opts.fields,
+					key: opts.key,
+					ts: opts.ts,
+				},
+			},
+		],
+		onsuccess: [],
+	};
+	const execplan: [typeof load, typeof opts.audit] = [load, opts.audit];
+
 	return {
 		namespace: "default",
 		name: `${opts.namespace}.${opts.event}`,
 		type: "BATCH",
-		providers: providers(),
+		providers: providers(validated),
 		onerror: ON_ERROR,
+		...(validated ? { onvalidationerror: ON_VALIDATION_ERROR } : {}),
 		source: {
 			empty: true,
 			meta: {},
@@ -288,27 +351,7 @@ function job(opts: {
 					name: `${opts.event}_procedure`,
 					logger: "false",
 					inputschema: "{}",
-					execplan: [
-						{
-							steps: [],
-							actions: [
-								{
-									name: `${opts.event}_writer`,
-									condition: [],
-									destination: "destination_storage",
-									params: {
-										table: opts.table,
-										action: opts.action,
-										fields: opts.fields,
-										key: opts.key,
-										ts: opts.ts,
-									},
-								},
-							],
-							onsuccess: [],
-						},
-						opts.audit,
-					],
+					execplan,
 					onsuccess: [],
 				},
 			},
@@ -528,6 +571,13 @@ export function silverJob(
 			watermark: entity.watermark && opts.target.quote(entity.watermark),
 			batchColumn: batch,
 		}),
+		validation:
+			entity.quality &&
+			validatorStep(
+				entity.name,
+				entity.quality.schema,
+				entity.keyed ? [entity.keyColumn] : [],
+			),
 	});
 
 	// Staging is in the target database: read it with the target credentials

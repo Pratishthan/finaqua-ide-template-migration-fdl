@@ -1,7 +1,12 @@
 import type ExcelJS from "exceljs";
 import { byHeader, normalizeHeader, readHeader } from "@/Mapping/cells.js";
 import { DEFAULT_LAYOUT, type SheetLayout } from "@/Mapping/layout.js";
-import type { Condition, MappingSpec, QueryStrategy } from "@/Mapping/types.js";
+import type {
+	Condition,
+	EntityAttribute,
+	MappingSpec,
+	QueryStrategy,
+} from "@/Mapping/types.js";
 
 /** The tabs are found by trimmed, case-insensitive name: the workbook as
  * delivered names the first one " DataMapping", with a leading space. */
@@ -101,6 +106,42 @@ export function parseMappingWorkbook(
 	}
 
 	return spec;
+}
+
+/** The data quality inputs. `undefined` when the workbook has no such tab, which
+ * is normal: most mapping workbooks keep the data model elsewhere. */
+export function parseEntityAttributes(
+	workbook: ExcelJS.Workbook,
+	sourceFile: string,
+	layout: SheetLayout = DEFAULT_LAYOUT,
+): EntityAttribute[] | undefined {
+	const { sheet: name, columns: col } = layout.entityAttributes;
+	const ws = sheet(workbook, name);
+	if (!ws) return undefined;
+
+	const header = readHeader(ws.getRow(1));
+	requireColumns(header, Object.values(col), { file: sourceFile, sheet: name });
+
+	const found: EntityAttribute[] = [];
+	ws.eachRow((row, n) => {
+		if (n === 1) return;
+
+		const get = (label: string) => byHeader(row, header, label);
+		const entity = get(col.entity).toLowerCase();
+		const column = get(col.column).toLowerCase();
+		if (!entity || !column) return;
+
+		found.push({
+			entity,
+			column,
+			dataType: get(col.dataType),
+			dataLength: get(col.dataLength),
+			nullable: get(col.nullable).toUpperCase(),
+			cell: cellRef(ws, n),
+		});
+	});
+
+	return found;
 }
 
 function parseConditions(

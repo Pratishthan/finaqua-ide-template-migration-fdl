@@ -10,9 +10,13 @@ import {
 	silverJob,
 } from "@/Mapping/finaqua.js";
 import { loadLayout } from "@/Mapping/layout.js";
-import { parseMappingWorkbook } from "@/Mapping/parse.js";
+import {
+	parseEntityAttributes,
+	parseMappingWorkbook,
+} from "@/Mapping/parse.js";
 import { buildPlan, DEFAULT_PLAN_OPTIONS } from "@/Mapping/plan.js";
-import type { Plan } from "@/Mapping/types.js";
+import { applyQualityRules } from "@/Mapping/quality.js";
+import type { EntityAttribute, Plan } from "@/Mapping/types.js";
 import { resolveDestinationPath, resolveExistingPath } from "@/utils.js";
 
 type CommonOptions = {
@@ -23,7 +27,30 @@ type CommonOptions = {
 	watermark: string;
 	keyColumn: string;
 	layout?: string;
+	dqWorkbook?: string;
 };
+
+/** entity_attributes from --dq-workbook, which must have the tab, or else from
+ * the mapping workbook, if it happens to have one. */
+async function readAttributes(
+	mapping: ExcelJS.Workbook,
+	file: string,
+	options: CommonOptions,
+): Promise<EntityAttribute[] | undefined> {
+	const layout = loadLayout(options.layout);
+	if (!options.dqWorkbook) {
+		return parseEntityAttributes(mapping, path.basename(file), layout);
+	}
+
+	const workbook = new ExcelJS.Workbook();
+	await workbook.xlsx.readFile(options.dqWorkbook);
+	const name = path.basename(options.dqWorkbook);
+	const attributes = parseEntityAttributes(workbook, name, layout);
+	if (!attributes) {
+		throw new Error(`${name}: no ${layout.entityAttributes.sheet} tab`);
+	}
+	return attributes;
+}
 
 async function readPlan(file: string, options: CommonOptions): Promise<Plan> {
 	const workbook = new ExcelJS.Workbook();
@@ -34,13 +61,16 @@ async function readPlan(file: string, options: CommonOptions): Promise<Plan> {
 		loadLayout(options.layout),
 	);
 
-	return buildPlan(spec, {
+	const plan = buildPlan(spec, {
 		...DEFAULT_PLAN_OPTIONS,
 		stagingPrefix: options.stagingPrefix,
 		watermarkColumn: options.watermark,
 		keyColumn: options.keyColumn,
 		target: dialect(options.targetDb),
 	});
+
+	const attributes = await readAttributes(workbook, file, options);
+	return attributes ? applyQualityRules(plan, attributes) : plan;
 }
 
 function jobOptions(options: CommonOptions): JobOptions {
@@ -90,6 +120,11 @@ function withCommonOptions(command: Command): Command {
 			)
 				.env("FDL_SHEET_LAYOUT")
 				.argParser(resolveExistingPath),
+		)
+		.option(
+			"--dq-workbook <file>",
+			"data model workbook whose entity_attributes tab gives the silver data quality checks",
+			resolveExistingPath,
 		);
 }
 
@@ -191,6 +226,10 @@ withCommonOptions(
 			console.log(`\n-- view ${view.name}\n${view.params.query}`);
 		}
 		console.log(`\n-- engine query\n${job.source.query}`);
+
+		if (entity?.quality) {
+			console.log(`\n-- data quality schema\n${entity.quality.schema}`);
+		}
 
 		const audit = job.srcevents[0]?.procedure.execplan[1]?.steps[0]?.sql;
 		for (const view of audit?.views ?? []) {

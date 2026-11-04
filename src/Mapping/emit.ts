@@ -146,6 +146,7 @@ function connections(opts: JobOptions) {
 			aquaErrorUser: "",
 			aquaErrorPassword: "",
 			errorWriterTopic: "",
+			validationErrorTopic: "",
 			errorWriterUrl: "",
 			errorWriterDriver: "",
 			errorWriterUser: "",
@@ -207,6 +208,26 @@ function renderCoverage(plan: Plan, opts: JobOptions): string {
 		lines.push(
 			`| ${s.name} | ${s.strategy} | ${reads.join(", ")} | ${s.columns.length} | ${s.keyed ? s.keyColumn : "-"} | ${s.watermark ? "yes" : "no"} |`,
 		);
+	}
+
+	lines.push("\n## Data quality - silver checks from entity_attributes\n");
+	if (!plan.silver.some((s) => s.quality)) {
+		lines.push(
+			"None: no entity_attributes tab was given, so the jobs have no validator step.",
+		);
+	} else {
+		lines.push(
+			"A row failing any check is sent to `validationErrorTopic` instead of being written, so its entity's recon reports `N`.\n",
+		);
+		lines.push("| entity | columns checked | not nullable | not checked |");
+		lines.push("|---|---|---|---|");
+		for (const s of plan.silver) {
+			lines.push(
+				s.quality
+					? `| ${s.name} | ${s.quality.columns} | ${s.quality.required} | ${s.quality.unchecked.join(", ") || "-"} |`
+					: `| ${s.name} | - | - | all |`,
+			);
+		}
 	}
 
 	if (errors.length > 0) {

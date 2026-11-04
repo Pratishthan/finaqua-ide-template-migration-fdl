@@ -24,6 +24,16 @@ export type SheetLayout = {
 			strategy: string;
 		};
 	};
+	entityAttributes: {
+		sheet: string;
+		columns: {
+			entity: string;
+			column: string;
+			dataType: string;
+			dataLength: string;
+			nullable: string;
+		};
+	};
 };
 
 /** Matches the reference workbook. Workbooks laid out
@@ -48,6 +58,16 @@ export const DEFAULT_LAYOUT: SheetLayout = {
 			entity: "entity_name",
 			clause: "join_condition",
 			strategy: "query_strategy",
+		},
+	},
+	entityAttributes: {
+		sheet: "entity_attributes",
+		columns: {
+			entity: "entity_name",
+			column: "column_name",
+			dataType: "data_type",
+			dataLength: "data_length",
+			nullable: "nullable",
 		},
 	},
 };

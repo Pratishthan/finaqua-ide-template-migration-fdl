@@ -57,6 +57,20 @@ export type MappingSpec = {
 	skipped: { cell: string; reason: string }[];
 };
 
+/** One row of the data model's entity_attributes tab: what an FDL column must
+ * hold, as opposed to how it is mapped. */
+export type EntityAttribute = {
+	entity: string;
+	column: string;
+	/** As written, e.g. "VARCHAR", "NUMERIC(20,4)". */
+	dataType: string;
+	/** As written, e.g. "50"; blank for types that carry no length. */
+	dataLength: string;
+	/** Upper-cased; "Y" and "N" are the meaningful values. */
+	nullable: string;
+	cell: string;
+};
+
 export type IssueLevel = "error" | "warning" | "info";
 
 /** Something in the workbook a reviewer has to see. Errors are problems that
@@ -142,6 +156,20 @@ export type SilverEntity = {
 	keyed: boolean;
 	/** FDL column carrying the source change time, e.g. "data_persistance_time". */
 	watermark?: string | undefined;
+	/** Data quality checks; without them the job has no validator step. */
+	quality?: QualityRules | undefined;
+};
+
+/** The checks of one FDL entity, ready for the job's validator step. */
+export type QualityRules = {
+	/** JSON schema, serialised the way JsonSchemaValidator takes it. */
+	schema: string;
+	/** Columns the schema has a rule for. */
+	columns: number;
+	/** Columns that must not be null. */
+	required: number;
+	/** FDL columns with no entity_attributes row. */
+	unchecked: string[];
 };
 
 export type Plan = {
