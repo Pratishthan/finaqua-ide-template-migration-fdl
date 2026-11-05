@@ -54,6 +54,11 @@ export type MappingSpec = {
 	sourceFile: string;
 	rows: MappingRow[];
 	conditions: Condition[];
+	/** BronzeMappings rows: the entity is the staging table, the column a
+	 * staging column. Without them the staging tables are derived from `rows`. */
+	bronzeRows?: MappingRow[] | undefined;
+	/** Where `bronzeRows` came from, for the report. */
+	bronzeSource?: string | undefined;
 	skipped: { cell: string; reason: string }[];
 };
 
@@ -106,7 +111,8 @@ export type BronzeTable = {
 	staging: string;
 	/** Physical source columns the FDL mapping needs, in first-seen order. */
 	columns: Column[];
-	/** Standard columns, in sheet order, after `columns`. */
+	/** Columns that are not a same-name copy of a source column - renamed copies,
+	 * rules and pipeline values - in sheet order, after `columns`. */
 	standard: StandardColumn[];
 	/** Source column -> the name staging holds it under, for a source column
 	 * copied into a standard column (`_modifiedon` -> metadata_persisted_timestamp). */

@@ -1,9 +1,14 @@
 import type ExcelJS from "exceljs";
 import { byHeader, normalizeHeader, readHeader } from "@/Mapping/cells.js";
-import { DEFAULT_LAYOUT, type SheetLayout } from "@/Mapping/layout.js";
+import {
+	DEFAULT_LAYOUT,
+	type MappingColumns,
+	type SheetLayout,
+} from "@/Mapping/layout.js";
 import type {
 	Condition,
 	EntityAttribute,
+	MappingRow,
 	MappingSpec,
 	QueryStrategy,
 } from "@/Mapping/types.js";
@@ -63,37 +68,7 @@ export function parseMappingWorkbook(
 		sheet: mappingName,
 	});
 
-	mapping.eachRow((row, n) => {
-		if (n === 1) return;
-
-		const get = (name: string) => byHeader(row, header, name);
-		const entity = get(col.entity).toLowerCase();
-		const column = get(col.column).toLowerCase();
-		const cell = cellRef(mapping, n);
-
-		if (!entity && !column) return;
-		if (!entity || !column) {
-			spec.skipped.push({ cell, reason: "entity or column name is blank" });
-			return;
-		}
-
-		const rule = get(col.rule);
-		if (!rule) {
-			spec.skipped.push({ cell, reason: `${entity}.${column} has no rule` });
-			return;
-		}
-
-		spec.rows.push({
-			entity,
-			column,
-			fdlType: get(col.fdlType).toLowerCase(),
-			sourceEntity: get(col.sourceEntity).toLowerCase(),
-			sourceColumn: get(col.sourceColumn),
-			sourceType: get(col.sourceType).toLowerCase(),
-			rule,
-			cell,
-		});
-	});
+	spec.rows = readMappingRows(mapping, header, col, spec.skipped);
 
 	// The Conditions tab is optional, but one the layout names explicitly must
 	// exist: a typo there would otherwise drop every join and union unnoticed.
@@ -142,6 +117,74 @@ export function parseEntityAttributes(
 	});
 
 	return found;
+}
+
+/** DataMapping and BronzeMappings share a layout: one row per target column. */
+function readMappingRows(
+	ws: ExcelJS.Worksheet,
+	header: Record<string, number>,
+	col: MappingColumns,
+	skipped: MappingSpec["skipped"],
+): MappingRow[] {
+	const rows: MappingRow[] = [];
+
+	ws.eachRow((row, n) => {
+		if (n === 1) return;
+
+		const get = (name: string) => byHeader(row, header, name);
+		const entity = get(col.entity).toLowerCase();
+		const column = get(col.column).toLowerCase();
+		const cell = cellRef(ws, n);
+
+		if (!entity && !column) return;
+		if (!entity || !column) {
+			skipped.push({ cell, reason: "entity or column name is blank" });
+			return;
+		}
+
+		const rule = get(col.rule);
+		if (!rule) {
+			skipped.push({ cell, reason: `${entity}.${column} has no rule` });
+			return;
+		}
+
+		rows.push({
+			entity,
+			column,
+			fdlType: get(col.fdlType).toLowerCase(),
+			sourceEntity: get(col.sourceEntity).toLowerCase(),
+			sourceColumn: get(col.sourceColumn),
+			sourceType: get(col.sourceType).toLowerCase(),
+			rule,
+			cell,
+		});
+	});
+
+	return rows;
+}
+
+/**
+ * The source -> staging mapping: one row per staging column, the entity being
+ * the staging table. Adds the rows to `spec`, so the bronze jobs are built from
+ * them instead of being derived from DataMapping. Returns false when the
+ * workbook has no such tab.
+ */
+export function parseBronzeMapping(
+	workbook: ExcelJS.Workbook,
+	sourceFile: string,
+	spec: MappingSpec,
+	layout: SheetLayout = DEFAULT_LAYOUT,
+): boolean {
+	const { sheet: name, columns: col } = layout.bronzeMapping;
+	const ws = sheet(workbook, name);
+	if (!ws) return false;
+
+	const header = readHeader(ws.getRow(1));
+	requireColumns(header, Object.values(col), { file: sourceFile, sheet: name });
+
+	spec.bronzeRows = readMappingRows(ws, header, col, spec.skipped);
+	spec.bronzeSource = `${sourceFile} (${name})`;
+	return true;
 }
 
 function parseConditions(

@@ -27,7 +27,9 @@ Read [OPEN-QUESTIONS.md](OPEN-QUESTIONS.md) before a first deployment.
 
 ```bash
 pnpm install
-pnpm run generate test/sample/FinacleCDH_Person_Mapping.xlsx ./out
+pnpm run generate test/sample/FinacleCDH_Person_MappingNew.xlsx ./out \
+  --bronze-mapping test/sample/FinacleCDH_Person_Bronze_Mapping.xlsx \
+  --dq-workbook test/sample/FinacleCDH_Person_CDM.xlsx
 ```
 
 Then read `out/coverage.md`. It lists every sheet defect, each against its cell.
@@ -49,6 +51,38 @@ Then read `out/coverage.md`. It lists every sheet defect, each against its cell.
 | `--staging-prefix` | `s_` | Staging table prefix |
 | `--watermark` | `metadata_persisted_timestamp` | FDL column carrying the source change time |
 | `--key-column` | `metadata_business_key_value` | FDL column holding the business key, used as the upsert key |
+| `--bronze-mapping <file>` | the mapping workbook | Workbook whose `BronzeMappings` tab defines the staging tables; without one, staging is derived from `DataMapping` |
+| `--dq-workbook <file>` | the mapping workbook | Workbook whose `entity_attributes` tab gives the data quality checks |
+
+## Data quality
+
+```bash
+pnpm run generate test/sample/FinacleCDH_Person_Mapping.xlsx ./out --dq-workbook test/sample/FinacleCDH_Person_CDM.xlsx
+```
+
+`--dq-workbook` names the data model workbook. Its `entity_attributes` tab becomes a validator
+step before the writer in every silver job, full and incremental. Without the option, the tab is
+read from the mapping workbook if it has one; with neither, the jobs have no validator step.
+Only `entity_attributes` is read from the data model, not its own `Data Mapping` tab.
+
+| Column | Check |
+|---|---|
+| `nullable` = `N` | The column must be present and not null |
+| `data_type` | JSON type; dates and timestamps must also match the format the writer parses |
+| `data_length` | `maxLength` for text. The precision in `NUMERIC(p,s)` limits the digits left of the point |
+
+A row that fails is not written. It goes to `validationErrorTopic` with every failure listed.
+Set that placeholder in `connections.json`.
+
+- **Recon:** rejected rows count as source but not target, so that entity's audit row reports
+  `recon_success_status = 'N'` even though the job succeeded.
+- **Incremental:** the watermark still moves past a rejected row, so it does not come back until
+  it changes at the source again.
+- **PII:** the message holds the whole row, so restrict access to the topic.
+
+Mismatches between the mapping and `entity_attributes` are warnings in `coverage.md`, which also
+lists what was checked per entity. A `--layout` file can rename the tab and columns under
+`entityAttributes`.
 
 ## Running a bundle
 
@@ -61,7 +95,15 @@ Then read `out/coverage.md`. It lists every sheet defect, each against its cell.
 
 ## How it works
 
-- **Bronze** copies only the source columns the mapping needs, plus the standard
+- **Bronze from BronzeMappings** (`--bronze-mapping`): one row per staging column, with
+  `entity_name` as the staging table and `data_type` its column type. Each staging table
+  reads exactly one source table. A same-name `##STRAIGHTMOVE` is copied as is, a renamed
+  one (`_modifiedon` -> `metadata_persisted_timestamp`) is copied under the new name, a
+  rule runs on the source, and `##PIPELINEGENERATED` is filled by the job. The straight
+  move into `metadata_persisted_timestamp` drives the incremental filter, and a
+  `metadata_business_key_value` rule is the upsert key. DataMapping then reads staging by
+  these names, and a straight move from a column staging lacks is an error.
+- **Bronze without it** copies only the source columns the mapping needs, plus the standard
   `metadata_*` / `audit_*` columns, taken from the FDL rows that read the table
   (`_createdon` / `_modifiedon` are staged as `metadata_source_created_timestamp` /
   `metadata_persisted_timestamp`). A sheet without them gets `batch_run_id` and a
@@ -104,9 +146,13 @@ src/Mapping/
   dialect.ts   database types, quoting, concatenation
   finaqua.ts   plan -> job JSON (shared skeleton for bronze and silver)
   ddl.ts       plan -> DDL
+  quality.ts   entity_attributes -> validator JSON schema
   emit.ts      writes the bundle and coverage.md
 src/scripts/verify-postgres.ts
 src/index.ts   CLI
 test/sample/ example workbooks: FinacleCDH_Person_Mapping.xlsx (default layout),
+             FinacleCDH_Person_MappingNew.xlsx + FinacleCDH_Person_Bronze_Mapping.xlsx
+             (silver and bronze sheets, for --bronze-mapping),
+             FinacleCDH_Person_CDM.xlsx (entity_attributes for --dq-workbook),
              limits_canonical_native_mapping.xlsx (fdl_-prefixed layout)
 ```

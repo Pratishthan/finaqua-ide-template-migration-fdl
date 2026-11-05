@@ -89,8 +89,10 @@ const ddlColumns = new Map(
 
 const added =
 	/^"?(batch_run_id|business_column_(name|value)|metadata_\w+|audit_\w+)\b/;
+// A source column staged under another name: `_modifiedon as
+// metadata_persisted_timestamp`, `_deleted as deleted`.
 const copied =
-	/(?:select |, )"?([A-Za-z_]\w*)"? as "?((?:metadata|audit)_\w+)"?(?=,| from )/g;
+	/(?:select |, )"?([A-Za-z_]\w*)"? as "?([A-Za-z_]\w*)"?(?=,| from )/g;
 const sourceTables = new Map<string, { staging: string; query: string }>();
 for (const job of bronzeJobs) {
 	const view = job.source.views.find(

@@ -9,8 +9,9 @@ import {
 	type LoadMode,
 	silverJob,
 } from "@/Mapping/finaqua.js";
-import { loadLayout } from "@/Mapping/layout.js";
+import { loadLayout, type SheetLayout } from "@/Mapping/layout.js";
 import {
+	parseBronzeMapping,
 	parseEntityAttributes,
 	parseMappingWorkbook,
 } from "@/Mapping/parse.js";
@@ -28,7 +29,14 @@ type CommonOptions = {
 	keyColumn: string;
 	layout?: string;
 	dqWorkbook?: string;
+	bronzeMapping?: string;
 };
+
+async function readWorkbook(file: string): Promise<ExcelJS.Workbook> {
+	const workbook = new ExcelJS.Workbook();
+	await workbook.xlsx.readFile(file);
+	return workbook;
+}
 
 /** entity_attributes from --dq-workbook, which must have the tab, or else from
  * the mapping workbook, if it happens to have one. */
@@ -36,16 +44,18 @@ async function readAttributes(
 	mapping: ExcelJS.Workbook,
 	file: string,
 	options: CommonOptions,
+	layout: SheetLayout,
 ): Promise<EntityAttribute[] | undefined> {
-	const layout = loadLayout(options.layout);
 	if (!options.dqWorkbook) {
 		return parseEntityAttributes(mapping, path.basename(file), layout);
 	}
 
-	const workbook = new ExcelJS.Workbook();
-	await workbook.xlsx.readFile(options.dqWorkbook);
 	const name = path.basename(options.dqWorkbook);
-	const attributes = parseEntityAttributes(workbook, name, layout);
+	const attributes = parseEntityAttributes(
+		await readWorkbook(options.dqWorkbook),
+		name,
+		layout,
+	);
 	if (!attributes) {
 		throw new Error(`${name}: no ${layout.entityAttributes.sheet} tab`);
 	}
@@ -53,13 +63,21 @@ async function readAttributes(
 }
 
 async function readPlan(file: string, options: CommonOptions): Promise<Plan> {
-	const workbook = new ExcelJS.Workbook();
-	await workbook.xlsx.readFile(file);
-	const spec = parseMappingWorkbook(
-		workbook,
-		path.basename(file),
-		loadLayout(options.layout),
-	);
+	const layout = loadLayout(options.layout);
+	const workbook = await readWorkbook(file);
+	const spec = parseMappingWorkbook(workbook, path.basename(file), layout);
+
+	// BronzeMappings from --bronze-mapping, which must have the tab, or else from
+	// the mapping workbook; with neither, staging is derived from DataMapping.
+	if (options.bronzeMapping) {
+		const name = path.basename(options.bronzeMapping);
+		const bronze = await readWorkbook(options.bronzeMapping);
+		if (!parseBronzeMapping(bronze, name, spec, layout)) {
+			throw new Error(`${name}: no ${layout.bronzeMapping.sheet} tab`);
+		}
+	} else {
+		parseBronzeMapping(workbook, path.basename(file), spec, layout);
+	}
 
 	const plan = buildPlan(spec, {
 		...DEFAULT_PLAN_OPTIONS,
@@ -69,7 +87,7 @@ async function readPlan(file: string, options: CommonOptions): Promise<Plan> {
 		target: dialect(options.targetDb),
 	});
 
-	const attributes = await readAttributes(workbook, file, options);
+	const attributes = await readAttributes(workbook, file, options, layout);
 	return attributes ? applyQualityRules(plan, attributes) : plan;
 }
 
@@ -120,6 +138,11 @@ function withCommonOptions(command: Command): Command {
 			)
 				.env("FDL_SHEET_LAYOUT")
 				.argParser(resolveExistingPath),
+		)
+		.option(
+			"--bronze-mapping <file>",
+			"workbook whose BronzeMappings tab defines the staging tables (source -> bronze)",
+			resolveExistingPath,
 		)
 		.option(
 			"--dq-workbook <file>",

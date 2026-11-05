@@ -3,18 +3,26 @@ import fs from "node:fs";
 /** Where the parser finds things in the workbook: the tab names and the header
  * label of each field. Labels are matched like any header - trimmed,
  * case-insensitive, spacing ignored - so only a real rename needs an entry. */
+export type MappingColumns = {
+	entity: string;
+	column: string;
+	fdlType: string;
+	sourceEntity: string;
+	sourceColumn: string;
+	sourceType: string;
+	rule: string;
+};
+
 export type SheetLayout = {
 	dataMapping: {
 		sheet: string;
-		columns: {
-			entity: string;
-			column: string;
-			fdlType: string;
-			sourceEntity: string;
-			sourceColumn: string;
-			sourceType: string;
-			rule: string;
-		};
+		columns: MappingColumns;
+	};
+	/** Source -> staging, same columns as DataMapping; the entity is the staging
+	 * table and data_type its column type. */
+	bronzeMapping: {
+		sheet: string;
+		columns: MappingColumns;
 	};
 	conditions: {
 		sheet: string;
@@ -42,6 +50,18 @@ export type SheetLayout = {
 export const DEFAULT_LAYOUT: SheetLayout = {
 	dataMapping: {
 		sheet: "DataMapping",
+		columns: {
+			entity: "entity_name",
+			column: "column_name",
+			fdlType: "data_type",
+			sourceEntity: "source_entity_name",
+			sourceColumn: "source_column_name",
+			sourceType: "source_data_type",
+			rule: "transformation_rule",
+		},
+	},
+	bronzeMapping: {
+		sheet: "BronzeMappings",
 		columns: {
 			entity: "entity_name",
 			column: "column_name",

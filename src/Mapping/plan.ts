@@ -76,6 +76,17 @@ const isStraight = (row: MappingRow) =>
 const isPipelineGenerated = (row: MappingRow) =>
 	row.rule.trim().toUpperCase() === PIPELINE_GENERATED;
 
+/** A rule of `##NA`: the column exists but nothing feeds it. */
+const isUnmapped = (row: MappingRow) => NONE.has(row.rule.trim().toLowerCase());
+
+/** What is wrong with an expression rule as written, if it plainly cannot run. */
+function ruleDefect(rule: string): string | undefined {
+	if ((rule.match(/'/g)?.length ?? 0) % 2 === 1)
+		return "has an unbalanced quote";
+	if (/\bas\s*$/i.test(rule)) return "ends in AS with no alias or type";
+	return undefined;
+}
+
 /** Name a source column has in its staging table. */
 export const stagedName = (table: BronzeTable, column: string) =>
 	table.stagedAs[column] ?? column;
@@ -186,6 +197,9 @@ class Planner {
 		readonly options: PlanOptions,
 	) {
 		for (const row of spec.rows) {
+			// A `##NA` column only told the derived staging to carry a source column
+			// (`entityid` for a COALESCE); it is not an FDL column.
+			if (NONE.has(row.column)) continue;
 			const rows = this.entities.get(row.entity) ?? [];
 			rows.push(row);
 			this.entities.set(row.entity, rows);
@@ -469,6 +483,216 @@ class Planner {
 	}
 
 	/**
+	 * Staging tables as BronzeMappings defines them, one per staging entity. A
+	 * same-name straight move is a plain column; a renamed one (`_modifiedon` ->
+	 * metadata_persisted_timestamp) is copied under the new name; a rule is
+	 * evaluated on the source; ##PIPELINEGENERATED is added by the job.
+	 *
+	 * Fills `physical` with the staging columns, keyed by source table, so the
+	 * silver rules - written against source table names - are checked against
+	 * what staging really holds.
+	 */
+	bronzeFromSheet(rows: MappingRow[]): BronzeTable[] {
+		const byTable = new Map<string, MappingRow[]>();
+		for (const row of rows) {
+			// As in DataMapping: a `##NA` column is no column at all, and staging one
+			// would write `... as ##na` into the query.
+			if (NONE.has(row.column)) continue;
+			const list = byTable.get(row.entity) ?? [];
+			list.push(row);
+			byTable.set(row.entity, list);
+		}
+
+		// Every table either sheet names, so a rule reading another one is caught.
+		const sources = new Set([
+			...rows.flatMap(sourceTablesOf),
+			...this.knownTables(),
+		]);
+		const result: BronzeTable[] = [];
+		const unkeyed = new Set<string>();
+
+		for (const [staging, tableRows] of byTable) {
+			const read = [...new Set(tableRows.flatMap(sourceTablesOf))];
+			const [source] = read;
+			if (!source || read.length > 1) {
+				this.issue(
+					"error",
+					staging,
+					`a staging table reads exactly one source table, got ${read.join(", ") || "none"} - not generated`,
+					tableRows[0]?.cell,
+				);
+				continue;
+			}
+			const other = result.find((b) => b.source === source);
+			if (other) {
+				this.issue(
+					"error",
+					staging,
+					`${source} is already staged as ${other.staging} - silver reads one staging table per source, so this one is not generated`,
+					tableRows[0]?.cell,
+				);
+				continue;
+			}
+
+			const columns: Column[] = [];
+			const standard: StandardColumn[] = [];
+			const stagedAs: Record<string, string> = {};
+			const seen = new Set<string>();
+			let watermark: string | undefined;
+
+			for (const r of tableRows) {
+				if (seen.has(r.column)) {
+					this.issue(
+						"warning",
+						staging,
+						`${r.column} has more than one row - the first is used`,
+						r.cell,
+					);
+					continue;
+				}
+				seen.add(r.column);
+				const type = r.fdlType || "text";
+
+				if (isPipelineGenerated(r)) {
+					standard.push(this.pipelineColumn(r, staging));
+				} else if (isStraight(r)) {
+					const column = r.sourceColumn.toLowerCase().trim();
+					if (NONE.has(column) || sourceTablesOf(r)[0] !== source) {
+						this.issue(
+							"error",
+							staging,
+							`${r.column}: a straight move needs a column of ${source}, got '${r.sourceEntity}.${r.sourceColumn}'`,
+							r.cell,
+						);
+						continue;
+					}
+					if (column === r.column) {
+						columns.push({ name: column, type });
+					} else {
+						standard.push({ name: r.column, type, copies: column });
+						stagedAs[column] = r.column;
+					}
+					if (r.column === this.options.watermarkColumn) watermark = column;
+				} else if (isUnmapped(r)) {
+					standard.push({
+						name: r.column,
+						type,
+						rule: `cast(null as ${pgType(type)})`,
+					});
+				} else {
+					const defect = ruleDefect(r.rule);
+					if (defect) {
+						this.issue(
+							"error",
+							staging,
+							`${r.column}: the rule ${defect} - the staging query will fail`,
+							r.cell,
+						);
+					}
+					const foreign = columnRefs(r.rule, sources).filter(
+						(ref) => ref.table !== source,
+					);
+					if (foreign.length > 0) {
+						this.issue(
+							"error",
+							staging,
+							`${r.column}: the rule reads ${foreign.map((f) => `${f.table}.${f.column}`).join(", ")}, but the staging query only reads ${source}`,
+							r.cell,
+						);
+					}
+					standard.push({
+						name: r.column,
+						type,
+						rule: ruleExpr(r.rule.trim(), type),
+					});
+				}
+			}
+
+			if (!watermark) {
+				this.issue(
+					"warning",
+					staging,
+					`no straight move into ${this.options.watermarkColumn} - incremental staging job not generated`,
+				);
+			}
+			// The key must differ row to row: a NULL never matches in an upsert, so
+			// every run inserts again, and a constant collapses every row into one.
+			const keyRow = tableRows.find((r) => r.column === this.options.keyColumn);
+			let keyed = [...columns, ...standard].some(
+				(c) => c.name === this.options.keyColumn && !("value" in c),
+			);
+			let reported = false;
+			if (keyed && keyRow && isUnmapped(keyRow)) {
+				keyed = false;
+				reported = true;
+				this.issue(
+					"error",
+					staging,
+					`${this.options.keyColumn} is ##NA, so every row stages a NULL key - an upsert never matches NULL, so it is not used as the upsert key`,
+					keyRow.cell,
+				);
+			} else if (keyed && keyRow && isStringLiteral(keyRow.rule)) {
+				keyed = false;
+				reported = true;
+				this.issue(
+					"error",
+					staging,
+					`${this.options.keyColumn} is the constant ${keyRow.rule.trim()} - upserting on it would collapse every row into one, so it is not used as the upsert key`,
+					keyRow.cell,
+				);
+			}
+			const keyColumn = keyed ? this.options.keyColumn : undefined;
+			if (!keyColumn && !reported) unkeyed.add(staging);
+
+			this.physical.set(
+				source,
+				new Map(
+					[...columns, ...standard].map((c) => [c.name, c.type] as const),
+				),
+			);
+			result.push({
+				source,
+				staging,
+				columns,
+				standard,
+				stagedAs,
+				key: [],
+				keyColumn,
+				watermark,
+			});
+		}
+
+		// Without a usable key column every incremental run inserts its rows again.
+		// Borrow the FDL business key, as the derived staging does, once `physical`
+		// holds every staging table - only from columns staged under their own
+		// name, since the key is concatenated in the source query.
+		const keys = this.stagingKeys();
+		for (const table of result) {
+			if (table.keyColumn) continue;
+			const key = keys.get(table.source) ?? [];
+			if (
+				key.length > 0 &&
+				key.every((k) => table.columns.some((c) => c.name === k))
+			) {
+				table.key = key;
+				this.issue(
+					"info",
+					table.staging,
+					`no usable ${this.options.keyColumn} - upserting on (${key.join(", ")}), the FDL business key, in business_column_value`,
+				);
+			} else if (unkeyed.has(table.staging)) {
+				this.issue(
+					"warning",
+					table.staging,
+					`no ${this.options.keyColumn} rule and no single-table business key in DataMapping - incremental loads insert, so every run adds its changed rows again`,
+				);
+			}
+		}
+
+		return result.sort((a, b) => a.source.localeCompare(b.source));
+	}
+
+	/**
 	 * The standard columns (metadata_*, audit_*) of a staging table. The sheet
 	 * maps them only for FDL entities, so they are borrowed from the first entity
 	 * whose standard rows read this table - the rows its query for this table
@@ -601,10 +825,18 @@ class Planner {
 	/** Checks a rule for defects that would make the silver query fail or load
 	 * the wrong thing. Reported against the row's cell. */
 	checkRule(row: MappingRow, tables: Set<string>) {
-		if (isPipelineGenerated(row)) return;
-		if (isStraight(row)) {
-			this.checkStraightTypes(row);
-			return;
+		if (isPipelineGenerated(row) || isUnmapped(row)) return;
+		// A straight move's types are checked where its staging column is known.
+		if (isStraight(row)) return;
+
+		const defect = ruleDefect(row.rule);
+		if (defect) {
+			this.issue(
+				"error",
+				row.entity,
+				`${row.column}: the rule ${defect} - the silver query will fail until the rule is fixed`,
+				row.cell,
+			);
 		}
 
 		for (const r of columnRefs(row.rule, tables)) {
@@ -639,8 +871,8 @@ class Planner {
 	/** A straight move between type families that cannot convert - an amount
 	 * into a timestamp column - is a sheet error; one that converts only for
 	 * some values (text into numeric) is a warning. */
-	checkStraightTypes(row: MappingRow) {
-		const from = family(row.sourceType);
+	checkStraightTypes(row: MappingRow, sourceType = row.sourceType) {
+		const from = family(sourceType);
 		const to = family(row.fdlType);
 		if (from === to || to === "text") return;
 
@@ -656,8 +888,8 @@ class Planner {
 			impossible ? "error" : "warning",
 			row.entity,
 			impossible
-				? `${row.column}: straight move of ${row.sourceType} into ${row.fdlType} - these types do not convert; the FDL type is probably wrong`
-				: `${row.column}: straight move of ${row.sourceType} into ${row.fdlType} - cast at load time, fails on any value that does not convert`,
+				? `${row.column}: straight move of ${sourceType} into ${row.fdlType} - these types do not convert; the FDL type is probably wrong`
+				: `${row.column}: straight move of ${sourceType} into ${row.fdlType} - cast at load time, fails on any value that does not convert`,
 			row.cell,
 		);
 	}
@@ -694,16 +926,29 @@ class Planner {
 			const strategy = conditions[0]?.strategy ?? "JOIN";
 			const sourceTables = [...new Set(rows.flatMap(sourceTablesOf))];
 
+			// A row reading the branch's table for a column beats a placeholder that
+			// reads no table (`CAST(NULL AS integer)`), which beats another table's
+			// constant (`'RetailExpense'`), wherever they sit in the sheet. A JOIN
+			// has every table: any row that reads one beats a placeholder.
+			const owns = (r: MappingRow, table?: string) => {
+				const read = sourceTablesOf(r);
+				if (table ? read.includes(table) : read.length > 0) return 0;
+				return read.length === 0 ? 1 : 2;
+			};
+
 			let branches: SilverBranch[];
 			if (strategy === "UNION") {
 				branches = sourceTables.map((table) =>
 					this.branch(
 						name,
-						rows.filter((r) => this.inBranch(r, table, tables)),
+						rows
+							.filter((r) => this.inBranch(r, table, tables))
+							.sort((a, b) => owns(a, table) - owns(b, table)),
 						conditions.find((c) => fromTables(c.clause)[0] === table)?.clause ??
 							`from ${table}`,
 						stagingOf,
 						conditions[0]?.cell,
+						table,
 					),
 				);
 			} else {
@@ -720,7 +965,13 @@ class Planner {
 				}
 				const clause = written || `from ${sourceTables[0] ?? name}`;
 				branches = [
-					this.branch(name, rows, clause, stagingOf, conditions[0]?.cell),
+					this.branch(
+						name,
+						[...rows].sort((a, b) => owns(a) - owns(b)),
+						clause,
+						stagingOf,
+						conditions[0]?.cell,
+					),
 				];
 			}
 
@@ -833,6 +1084,8 @@ class Planner {
 		clause: string,
 		stagingOf: (t: string) => BronzeTable | undefined,
 		conditionCell: string | undefined,
+		/** The UNION branch's table; rows are ranked for it already. */
+		table?: string,
 	): SilverBranch {
 		const { quote } = this.options.target;
 		const from = rewriteFromClause(clause, (t) => stagingOf(t)?.staging, quote);
@@ -868,7 +1121,19 @@ class Planner {
 		for (const row of rows) {
 			if (columns.some((c) => c.name === row.column)) {
 				// Mapped twice for the same branch: keep the first, as the sheet reads.
-				if (rows.filter((r) => r.column === row.column).length > 1) {
+				// A placeholder losing to the branch's own row is not a conflict.
+				// Only rows that disagree are a conflict: a branch's own row beats
+				// placeholders, and identical placeholders repeat per sheet block.
+				const same = rows.filter((r) => r.column === row.column);
+				const own = same.filter((r) =>
+					table
+						? sourceTablesOf(r).includes(table)
+						: sourceTablesOf(r).length > 0,
+				);
+				const rivals = own.length > 0 ? own : same;
+				const meaning = (r: MappingRow) =>
+					`${r.rule.trim().toLowerCase()}|${r.sourceColumn.toLowerCase()}`;
+				if (new Set(rivals.map(meaning)).size > 1) {
 					this.issue(
 						"warning",
 						entity,
@@ -883,11 +1148,15 @@ class Planner {
 			if (isPipelineGenerated(row)) continue;
 
 			let expr: string;
-			if (isStraight(row)) {
+			if (isUnmapped(row)) {
+				expr = `cast(null as ${pgType(row.fdlType || "text")})`;
+			} else if (isStraight(row)) {
 				const table = sourceTablesOf(row)[0] ?? "";
 				const alias = from.aliases.get(table);
 				const staging = stagingOf(table);
-				const column = row.sourceColumn.toLowerCase();
+				const column = staging
+					? stagedName(staging, row.sourceColumn.toLowerCase())
+					: row.sourceColumn.toLowerCase();
 				if (!alias) {
 					this.issue(
 						"error",
@@ -896,9 +1165,38 @@ class Planner {
 						row.cell,
 					);
 				}
+				const staged = staging
+					? [...staging.columns, ...staging.standard].find(
+							(c) => c.name === column,
+						)
+					: undefined;
+				if (staging && !staged) {
+					this.issue(
+						"error",
+						entity,
+						`${row.column}: ${staging.staging} has no column ${column} - the silver query will fail`,
+						row.cell,
+					);
+				}
+				// Silver reads staging, so the staging column's type decides the cast;
+				// source_data_type is only the sheet's account of it.
+				const sourceType = staged?.type || row.sourceType;
+				if (
+					staged?.type &&
+					!NONE.has(row.sourceType) &&
+					family(staged.type) !== family(row.sourceType)
+				) {
+					this.issue(
+						"warning",
+						entity,
+						`${row.column}: source_data_type is ${row.sourceType}, but ${staging?.staging}.${column} is ${staged.type} - cast from ${staged.type}`,
+						row.cell,
+					);
+				}
+				this.checkStraightTypes(row, sourceType);
 				expr = straightExpr(
-					`${quote(alias ?? table)}.${quote(staging ? stagedName(staging, column) : column)}`,
-					row.sourceType,
+					`${quote(alias ?? table)}.${quote(column)}`,
+					sourceType,
 					row.fdlType,
 				);
 			} else {
@@ -939,8 +1237,13 @@ class Planner {
 
 export function buildPlan(spec: MappingSpec, options: PlanOptions): Plan {
 	const planner = new Planner(spec, options);
-	planner.collectPhysical();
-	const bronze = planner.bronze();
+	let bronze: BronzeTable[];
+	if (spec.bronzeRows) {
+		bronze = planner.bronzeFromSheet(spec.bronzeRows);
+	} else {
+		planner.collectPhysical();
+		bronze = planner.bronze();
+	}
 	const silver = planner.silver(bronze);
 
 	for (const s of spec.skipped) {

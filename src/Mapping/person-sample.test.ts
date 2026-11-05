@@ -63,21 +63,37 @@ describe("FinacleCDH_Person_Mapping.xlsx with default configs", () => {
 		assert.equal(plan.silver.length, 25);
 	});
 
-	it("flags the one real sheet defect, and reports no others", () => {
+	it("flags the real sheet defects, and reports no others", () => {
 		const errors = plan.issues.filter((i) => i.level === "error");
-		assert.deepEqual(errors, [
-			{
-				level: "error",
-				scope: "financial_profile",
-				cell: "DataMapping!A737",
-				message:
-					"asset_market_value_currency: a straight move needs exactly one source table, got '##na'",
-			},
-		]);
+		assert.deepEqual(
+			errors.map((i) => `${i.cell} ${i.message.replace(/ - .*$/, "")}`),
+			[
+				"DataMapping!A737 asset_market_value_currency: a straight move needs exactly one source table, got '##na'",
+				// `Party'` and `customer_identifier.bank_identification'`
+				"DataMapping!A49 metadata_source_system_name: the rule has an unbalanced quote",
+				"DataMapping!A52 metadata_business_key_name: the rule has an unbalanced quote",
+				// `null as`
+				"DataMapping!A662 asset_market_value_currency: the rule ends in AS with no alias or type",
+				"DataMapping!A665 financial_remarks: the rule ends in AS with no alias or type",
+				"DataMapping!A687 asset_market_value_currency: the rule ends in AS with no alias or type",
+				"DataMapping!A690 financial_remarks: the rule ends in AS with no alias or type",
+				"DataMapping!A712 asset_market_value_currency: the rule ends in AS with no alias or type",
+			],
+		);
+	});
+
+	it("reads a UNION branch's own column before a placeholder written above it", () => {
+		const entity = plan.silver.find((s) => s.name === "financial_profile");
+		const asset = entity?.branches.find((b) =>
+			b.reads.includes("s_retailasset"),
+		);
+		const value = asset?.columns.find((c) => c.name === "asset_market_value");
+		assert.match(value?.expr ?? "", /retailasset\.marketvalue/);
 	});
 
 	it("pins the warning/note count so a planner change shows up here, not only in coverage.md", () => {
-		assert.equal(plan.issues.filter((i) => i.level === "warning").length, 78);
+		// The three blank rules; repeated identical placeholders are not conflicts.
+		assert.equal(plan.issues.filter((i) => i.level === "warning").length, 3);
 		assert.equal(plan.issues.filter((i) => i.level === "info").length, 0);
 	});
 
@@ -216,8 +232,8 @@ describe("FinacleCDH_Person_Mapping.xlsx with default configs", () => {
 
 			assert.equal(result.bronze, 28);
 			assert.equal(result.silver, 25);
-			assert.equal(result.errors, 1);
-			assert.equal(result.warnings, 78);
+			assert.equal(result.errors, 8);
+			assert.equal(result.warnings, 3);
 			// Every bronze/silver table has a watermark, so each gets an _incr
 			// variant: 2 x (28 + 25) job files, plus ddl.sql, connections.json and
 			// coverage.md.
@@ -255,7 +271,7 @@ describe("FinacleCDH_Person_Mapping.xlsx with default configs", () => {
 			);
 			assert.match(
 				coverage,
-				/sheet issues: \*\*1 errors\*\*, 78 warnings, 0 notes/,
+				/sheet issues: \*\*8 errors\*\*, 3 warnings, 0 notes/,
 			);
 		} finally {
 			fs.rmSync(dest, { recursive: true, force: true });
@@ -275,8 +291,8 @@ describe("FinacleCDH_Person_Mapping.xlsx with default configs", () => {
 			// 1 bronze + 1 silver job, each with an _incr variant, plus ddl.sql,
 			// connections.json, coverage.md.
 			assert.equal(result.files, 7);
-			// The financial_profile error is out of scope once person is selected.
-			assert.equal(result.errors, 0);
+			// Only person's two unbalanced quotes; financial_profile is out of scope.
+			assert.equal(result.errors, 2);
 
 			assert.deepEqual(fs.readdirSync(path.join(dest, "bronze")).sort(), [
 				"s_retail.json",

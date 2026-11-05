@@ -105,10 +105,20 @@ function spelled(attribute: EntityAttribute): string {
 		: type;
 }
 
+/** Whether every branch loads a column as a bare NULL (`##NA`, `cast(null ...)`). */
+function alwaysNull(entity: SilverEntity, column: string): boolean {
+	if (entity.pipeline.some((p) => p.name === column)) return false;
+	return entity.branches.every((b) =>
+		/^(cast\(\s*)?null\b/i.test(
+			b.columns.find((c) => c.name === column)?.expr.trim() ?? "null",
+		),
+	);
+}
+
 function entityRules(
 	entity: SilverEntity,
 	attributes: Map<string, EntityAttribute>,
-	issue: (message: string, cell?: string) => void,
+	issue: (message: string, cell?: string, level?: Issue["level"]) => void,
 ): QualityRules {
 	const properties: Record<string, ColumnSchema> = {};
 	const required: string[] = [];
@@ -123,8 +133,16 @@ function entityRules(
 		}
 
 		const { cell } = attribute;
-		if (attribute.nullable === "N") required.push(column.name);
-		else if (attribute.nullable !== "Y") {
+		if (attribute.nullable === "N") {
+			required.push(column.name);
+			if (alwaysNull(entity, column.name)) {
+				issue(
+					`${column.name} is not nullable in entity_attributes but the mapping never fills it - every row of ${entity.name} will be rejected`,
+					cell,
+					"error",
+				);
+			}
+		} else if (attribute.nullable !== "Y") {
 			issue(
 				`${column.name}: nullable '${attribute.nullable}' is not Y or N - null not checked`,
 				cell,
@@ -204,8 +222,13 @@ export function applyQualityRules(
 
 		return {
 			...entity,
-			quality: entityRules(entity, columns, (message, cell) =>
-				issues.push({ level: "warning", scope: entity.name, cell, message }),
+			quality: entityRules(entity, columns, (message, cell, level) =>
+				issues.push({
+					level: level ?? "warning",
+					scope: entity.name,
+					cell,
+					message,
+				}),
 			),
 		};
 	});
