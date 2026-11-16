@@ -2,7 +2,7 @@ import path from "node:path";
 import { Command, Option } from "commander";
 import ExcelJS from "exceljs";
 import { type DbType, dialect, parseDbType } from "@/Mapping/dialect.js";
-import { emitPlan } from "@/Mapping/emit.js";
+import { emitPlan, writeOpenMetadata } from "@/Mapping/emit.js";
 import {
 	bronzeJob,
 	type JobOptions,
@@ -10,6 +10,11 @@ import {
 	silverJob,
 } from "@/Mapping/finaqua.js";
 import { loadLayout, type SheetLayout } from "@/Mapping/layout.js";
+import {
+	checkSchemaName,
+	DEFAULT_OPENMETADATA_OPTIONS,
+	type OpenMetadataOptions,
+} from "@/Mapping/openmetadata.js";
 import {
 	parseBronzeMapping,
 	parseEntityAttributes,
@@ -151,6 +156,37 @@ function withCommonOptions(command: Command): Command {
 		);
 }
 
+type OpenMetadataFlags = {
+	omSourceSchema: string;
+	omTargetSchema: string;
+	/** False with --no-openmetadata. */
+	openmetadata?: boolean;
+};
+
+function openMetadataOptions(options: OpenMetadataFlags): OpenMetadataOptions {
+	return {
+		sourceSchema: options.omSourceSchema,
+		targetSchema: options.omTargetSchema,
+	};
+}
+
+/** Where the tables are catalogued: OpenMetadata's service.database.schema. */
+function withOpenMetadataOptions(command: Command): Command {
+	return command
+		.option(
+			"--om-source-schema <fqn>",
+			"OpenMetadata schema (service.database.schema) of the source tables",
+			checkSchemaName,
+			DEFAULT_OPENMETADATA_OPTIONS.sourceSchema,
+		)
+		.option(
+			"--om-target-schema <fqn>",
+			"OpenMetadata schema (service.database.schema) of the staging and FDL tables",
+			checkSchemaName,
+			DEFAULT_OPENMETADATA_OPTIONS.targetSchema,
+		);
+}
+
 const program = new Command();
 
 program
@@ -159,21 +195,26 @@ program
 		"generates FinAqua bronze (source -> staging) and silver (staging -> FDL) jobs from a Source-to-Silver mapping workbook",
 	);
 
-withCommonOptions(
-	program
-		.command("generate", { isDefault: true })
-		.description("write the FinAqua jobs, DDL and coverage report")
-		.argument("<workbook>", "mapping workbook (.xlsx)", resolveExistingPath)
-		.argument("<dest>", "output folder", resolveDestinationPath)
-		.option(
-			"-e, --entity <name>",
-			"only this FDL entity and the staging tables it reads",
-		),
+withOpenMetadataOptions(
+	withCommonOptions(
+		program
+			.command("generate", { isDefault: true })
+			.description(
+				"write the FinAqua jobs, DDL, coverage report and OpenMetadata lineage",
+			)
+			.argument("<workbook>", "mapping workbook (.xlsx)", resolveExistingPath)
+			.argument("<dest>", "output folder", resolveDestinationPath)
+			.option(
+				"-e, --entity <name>",
+				"only this FDL entity and the staging tables it reads",
+			)
+			.option("--no-openmetadata", "do not write the openMetadata/ folder"),
+	),
 ).action(
 	async (
 		workbook: string,
 		dest: string,
-		options: CommonOptions & { entity?: string },
+		options: CommonOptions & OpenMetadataFlags & { entity?: string },
 	) => {
 		const plan = await readPlan(workbook, options);
 
@@ -183,9 +224,13 @@ withCommonOptions(
 			);
 		}
 
-		const result = await emitPlan(plan, dest, jobOptions(options), {
-			entity: options.entity,
-		});
+		const result = await emitPlan(
+			plan,
+			dest,
+			jobOptions(options),
+			{ entity: options.entity },
+			options.openmetadata === false ? undefined : openMetadataOptions(options),
+		);
 
 		console.log(
 			`${result.bronze} staging tables, ${result.silver} FDL entities -> ${result.files} files in ${dest}`,
@@ -193,6 +238,55 @@ withCommonOptions(
 		console.log(
 			`sheet issues: ${result.errors} errors, ${result.warnings} warnings - see ${path.join(dest, "coverage.md")}`,
 		);
+	},
+);
+
+withOpenMetadataOptions(
+	withCommonOptions(
+		program
+			.command("gen_openmetadata")
+			.description(
+				"write only the OpenMetadata tables and column lineage (source -> staging -> FDL)",
+			)
+			.argument("<workbook>", "mapping workbook (.xlsx)", resolveExistingPath)
+			.argument("<dest>", "output folder", resolveDestinationPath)
+			.option(
+				"-e, --entity <name>",
+				"only this FDL entity and the staging tables it reads",
+			),
+	),
+).action(
+	async (
+		workbook: string,
+		dest: string,
+		options: CommonOptions & OpenMetadataFlags & { entity?: string },
+	) => {
+		const plan = await readPlan(workbook, options);
+		const silver = plan.silver.filter(
+			(s) => !options.entity || s.name === options.entity,
+		);
+		if (options.entity && silver.length === 0) {
+			throw new Error(
+				`no FDL entity '${options.entity}' in ${path.basename(workbook)}`,
+			);
+		}
+		const reads = new Set(
+			silver.flatMap((s) => s.branches.flatMap((b) => b.reads)),
+		);
+		const scoped: Plan = options.entity
+			? {
+					...plan,
+					silver,
+					bronze: plan.bronze.filter((b) => reads.has(b.staging)),
+				}
+			: plan;
+
+		const files = await writeOpenMetadata(
+			scoped,
+			dest,
+			openMetadataOptions(options),
+		);
+		console.log(`${files} files in ${path.join(dest, "openMetadata")}`);
 	},
 );
 

@@ -7,6 +7,10 @@ import {
 	type LoadMode,
 	silverJob,
 } from "@/Mapping/finaqua.js";
+import {
+	buildOpenMetadata,
+	type OpenMetadataOptions,
+} from "@/Mapping/openmetadata.js";
 import type { Issue, Plan } from "@/Mapping/types.js";
 
 export type EmitResult = {
@@ -36,6 +40,8 @@ async function writeJson(file: string, data: unknown): Promise<void> {
  *   ddl.sql                                      tables the jobs write to
  *   connections.json                             placeholders to fill at deploy
  *   coverage.md                                  what was generated, and every sheet issue
+ *   openMetadata/                                tables and column lineage, for the
+ *                                                OpenMetadata deployer (unless turned off)
  *
  * An _incr file is only written when the table has a watermark column; without
  * one there is nothing to be incremental on, and that is listed in coverage.md.
@@ -45,6 +51,7 @@ export async function emitPlan(
 	destination: string,
 	opts: JobOptions,
 	only?: { entity?: string | undefined },
+	openMetadata?: OpenMetadataOptions | undefined,
 ): Promise<EmitResult> {
 	let files = 0;
 
@@ -115,6 +122,9 @@ export async function emitPlan(
 	);
 	files += 3;
 
+	if (openMetadata)
+		files += await writeOpenMetadata(emitted, destination, openMetadata);
+
 	return {
 		bronze: wantedBronze.length,
 		silver: wantedSilver.length,
@@ -122,6 +132,30 @@ export async function emitPlan(
 		errors: emitted.issues.filter((i) => i.level === "error").length,
 		warnings: emitted.issues.filter((i) => i.level === "warning").length,
 	};
+}
+
+/** OpenMetadata's tables and lineage edges, in the layout the deployer reads. */
+export async function writeOpenMetadata(
+	plan: Plan,
+	destination: string,
+	options: OpenMetadataOptions,
+): Promise<number> {
+	const { sources, destinations, lineageEdges } = buildOpenMetadata(
+		plan,
+		options,
+	);
+	const dir = path.join(destination, "openMetadata");
+	for (const table of sources) {
+		await writeJson(path.join(dir, "sources", `${table.name}.json`), table);
+	}
+	for (const table of destinations) {
+		await writeJson(
+			path.join(dir, "destinations", `${table.name}.json`),
+			table,
+		);
+	}
+	await writeJson(path.join(dir, "lineageEdges", "edge.json"), lineageEdges);
+	return sources.length + destinations.length + 1;
 }
 
 /** Every placeholder the jobs reference, with the driver and URL shape for the
@@ -178,6 +212,7 @@ function renderCoverage(plan: Plan, opts: JobOptions): string {
 		`- source database: **${opts.source.type}**, target database: **${opts.target.type}**`,
 		`- batch name: **${opts.batchName}**`,
 		`- mapping rows read: **${plan.spec.rows.length}**`,
+		`- staging tables: ${plan.spec.bronzeSource ? `from **${plan.spec.bronzeSource}**` : "derived from the mapping (no BronzeMappings tab given)"}`,
 		`- bronze (staging) jobs: **${plan.bronze.length}** tables, ${plan.bronze.filter((b) => b.watermark).length} with an incremental variant`,
 		`- silver (FDL) jobs: **${plan.silver.length}** entities, ${plan.silver.filter((s) => s.watermark).length} with an incremental variant`,
 		`- sheet issues: **${errors.length} errors**, ${warnings.length} warnings, ${infos.length} notes\n`,

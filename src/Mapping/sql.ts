@@ -270,7 +270,8 @@ export function fromAliases(clause: string): Map<string, string> {
 		const alias = identName(tokens[aliasAt]);
 		aliases.set(
 			alias !== undefined &&
-				!NOT_AN_ALIAS.has(alias) &&
+				// `as "limit"` is an alias: quoting is how a keyword becomes one.
+				(tokens[aliasAt]?.kind === "quoted" || !NOT_AN_ALIAS.has(alias)) &&
 				tokens[aliasAt]?.kind !== "punct"
 				? alias
 				: table,
