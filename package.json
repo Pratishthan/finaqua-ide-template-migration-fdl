@@ -10,6 +10,7 @@
 		"typecheck": "tsc --noEmit",
 		"test": "tsx --test \"src/**/*.test.ts\"",
 		"generate": "tsx src/index.ts generate",
+		"gen_openmetadata": "tsx src/index.ts gen_openmetadata",
 		"inspect": "tsx src/index.ts inspect",
 		"verify:pg": "tsx src/scripts/verify-postgres.ts",
 		"check": "biome check .",

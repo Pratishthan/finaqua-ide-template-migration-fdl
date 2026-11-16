@@ -9,6 +9,7 @@ mapping.xlsx                     out/
   Conditions   (joins/unions)      ddl.sql                        every table the jobs write
                                    connections.json               placeholders to fill at deploy
                                    coverage.md                    what was generated + sheet defects
+                                   openMetadata/                  tables + column lineage for OpenMetadata
 ```
 
 The Finacle CDH Person workbook ([test/sample/FinacleCDH_Person_Mapping.xlsx](test/sample/FinacleCDH_Person_Mapping.xlsx))
@@ -39,6 +40,7 @@ Then read `out/coverage.md`. It lists every sheet defect, each against its cell.
 | Command | What it does |
 |---|---|
 | `pnpm run generate <workbook> <dest> [-e <entity>]` | Write the bundle, or only one FDL entity and its staging tables |
+| `pnpm run gen_openmetadata <workbook> <dest> [-e <entity>]` | Write only `openMetadata/` (tables and lineage) |
 | `pnpm run inspect <workbook>` | List sheet issues |
 | `pnpm run inspect <workbook> <entity\|s_table> [-i]` | Print one job's SQL (`-i` for the incremental variant) |
 | `pnpm run verify:pg <dest> <postgres-url>` | `EXPLAIN` every generated query on a scratch Postgres database |
@@ -53,6 +55,9 @@ Then read `out/coverage.md`. It lists every sheet defect, each against its cell.
 | `--key-column` | `metadata_business_key_value` | FDL column holding the business key, used as the upsert key |
 | `--bronze-mapping <file>` | the mapping workbook | Workbook whose `BronzeMappings` tab defines the staging tables; without one, staging is derived from `DataMapping` |
 | `--dq-workbook <file>` | the mapping workbook | Workbook whose `entity_attributes` tab gives the data quality checks |
+| `--om-source-schema <fqn>` | `Postgres.postgres_db.postgres_schema` | OpenMetadata `service.database.schema` of the source tables |
+| `--om-target-schema <fqn>` | `FDL.lake_db.lake_schema` | OpenMetadata schema of the staging and FDL tables |
+| `--no-openmetadata` | | `generate` without the `openMetadata/` folder |
 
 ## Data quality
 
@@ -83,6 +88,25 @@ Set that placeholder in `connections.json`.
 Mismatches between the mapping and `entity_attributes` are warnings in `coverage.md`, which also
 lists what was checked per entity. A `--layout` file can rename the tab and columns under
 `entityAttributes`.
+
+## OpenMetadata lineage
+
+`generate` also writes `openMetadata/`, in the layout `finaqua-ide-template-fdl` writes and the
+`finaqua-ide-deploy-openmetadata` deployer publishes (`pnpm run deploy -- <dest> <url> <jwt>`
+there):
+
+| File | Holds |
+|---|---|
+| `sources/<table>.json` | each source table a bronze job reads, with the columns it reads |
+| `destinations/<table>.json` | each staging table and FDL entity, columns as `ddl.sql` creates them; the upsert key as a `UNIQUE` constraint |
+| `lineageEdges/edge.json` | one edge per source -> staging and staging -> FDL table pair, with column lineage |
+
+Column lineage comes from the same plan the jobs are built from. A straight move (including a
+renamed copy such as `_modifiedon` -> `metadata_persisted_timestamp`) is `DIRECT`. Any other rule
+records the sheet expression as the function, with the columns it reads. Columns read only in a
+`CASE WHEN` condition are left out. Constants and pipeline values have no lineage. A column the
+sheet reads but staging does not carry is left out too; it is already an error in `coverage.md`.
+Types map to OpenMetadata's (`varchar(50)` -> `VARCHAR`, length 50; `_jsonb` -> `ARRAY` of `JSON`).
 
 ## Running a bundle
 
